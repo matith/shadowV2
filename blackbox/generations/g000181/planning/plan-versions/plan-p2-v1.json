@@ -1,0 +1,1 @@
+{"actor_id":"mimo-sol-shiguang-v2","actor_role":"AI","affected_module_ids":[],"assumptions":[],"created_at":"2026-09-25T16:34:51.487Z","goal":"P2：多渠道、能力注册表全面接入、后台智能、可插拔 Memory 对比、多投影与工作流。","id":"plan-p2-v1","non_goals":["避免复杂 RBAC 官僚化"],"parent_plan_version_id":null,"planning_scope_id":"p2","risks":[],"target_entity_ids":[],"version":1}

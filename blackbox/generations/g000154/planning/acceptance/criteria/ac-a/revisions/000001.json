@@ -1,0 +1,1 @@
+{"actor_id":"mimo-sol-shiguang-v2","actor_role":"AI","created_at":"2026-09-25T16:34:53.327Z","description":"Scenario A 日常承诺：用户说「明天下午提醒我联系李经理，合同还没盖章」→ Event+Matter+People+Reminder+Capsule；次日提醒送达；后续更新收敛同一 Matter；可恢复当前状态。","evidence_ids":[],"origin_source":"USER","reason":null,"revision":1,"status":"ACTIVE","verification":"UNVERIFIED"}

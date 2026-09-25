@@ -1,0 +1,1 @@
+{"changeset_id":null,"current_revision":1,"description":"X7 Summary 一致：summary.basis_revision == module.current_revision，否则标记 STALE 不得当现况。","id":"ac-x7","origin_source":"USER","owner_id":"11dd729c-beaa-42cf-bad1-a06ab4f89e1b","owner_type":"PROJECT","status":"ACTIVE"}

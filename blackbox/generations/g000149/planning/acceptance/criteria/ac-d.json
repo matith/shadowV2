@@ -1,0 +1,1 @@
+{"changeset_id":null,"current_revision":1,"description":"Scenario D 子事项：主项目含子项；子项变化只增量影响父摘要；无变化停止传播；不重扫整树。","id":"ac-d","origin_source":"USER","owner_id":"11dd729c-beaa-42cf-bad1-a06ab4f89e1b","owner_type":"PROJECT","status":"ACTIVE"}
