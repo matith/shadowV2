@@ -43,6 +43,17 @@
 
 **图快照：** 68 节点 / **91** 关系（contains 56, depends_on 13, produces_for 12, related_to 7, references 3）
 
+## 夜间施工前收边（g000259）
+
+| 项 | 处置 |
+| --- | --- |
+| `q-template-v2` blocking 字段不一致 | 无 update API；以 **dec-open-question-gate** 规定门禁=`status==OPEN && blocking==true`。RESOLVED 不阻塞 |
+| P0 施工清单不全 | 新 **plan-p0-v3**（35 模块）补：model-adapter、working-context-compiler、raw-source-store、delivery-router、delayed-scheduled-runner、table-projection、ledger-router、change-receipt、dirty-tracker 等 |
+| 范围锁 | P0 only；**不自动进 P1** |
+
+**Identity 人工门禁（开工前核对，勿跳过）：**  
+`repo=matith/shadowV2` · `root=D:\LIB\mimo\shadowV2` · `uuid=11dd729c-beaa-42cf-bad1-a06ab4f89e1b` · `generation>=g000256`
+
 ## 结论（修订）
 
-> 六项收边已完成并核实。在 **Identity 硬门禁仍 ACCEPTED_BUT_NOT_IMPLEMENTED** 的前提下，允许进入 P0 代码施工；不得宣称 Identity Gate 已落地。
+> 六项收边 + 执行层两项收边已完成。在 **Identity 硬门禁仍 ACCEPTED_BUT_NOT_IMPLEMENTED**（人工核对替代）的前提下，允许按 **plan-p0-v3** 进入 P0 连续施工；**P0 通过后停止，不自动进入 P1**。

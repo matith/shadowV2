@@ -1,0 +1,1 @@
+{"changeset_id":null,"current_revision":1,"description":"X1 执行绑定：op_id 幂等，重试不双写。","id":"ac-x1-binding","origin_source":"USER","owner_id":"op-validator","owner_type":"MODULE","status":"ACTIVE"}
