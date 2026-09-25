@@ -1,0 +1,9 @@
+.blackbox-local/
+blackbox/.staging/
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+.vscode/
+.idea/

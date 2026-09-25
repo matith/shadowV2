@@ -1,0 +1,41 @@
+{
+  "project": {
+    "id": "shiguang-v2",
+    "name": "拾光 V2",
+    "root": "D:\\LIB\\mimo\\shadowV2",
+    "description": "长期陪伴用户的 Personal Ledger Agent：维护现实状态账本，历史与当前状态分离，Source 与 Interpretation 分离。"
+  },
+  "modules": [
+    {"id": "interaction-layer", "name": "Interaction Layer", "summary": "多渠道消息规范化进出；不绑定业务状态到单一 Channel。", "visual_group_id": "group-runtime", "x": 80, "y": 80},
+    {"id": "agent-runtime", "name": "Agent Runtime", "summary": "可替换模型循环发动机；工具经 Registry；不得直写 Canonical 真源。", "visual_group_id": "group-runtime", "x": 80, "y": 280},
+    {"id": "context-engine", "name": "Context Engine", "summary": "Context Compiler / Ledger Router / Retrieval / Budget；按需生成 Working Context。", "visual_group_id": "group-runtime", "x": 80, "y": 480},
+    {"id": "personal-ledger-core", "name": "Personal Ledger Core", "summary": "Canonical 业务真源：Matter/Event/People/Knowledge/Product/File/Directive/Archive 多账本。", "visual_group_id": "group-core", "x": 400, "y": 200},
+    {"id": "source-evidence", "name": "Source & Evidence", "summary": "Raw Source 不可变；Interpretation 可纠正；完整 provenance。", "visual_group_id": "group-core", "x": 400, "y": 400},
+    {"id": "state-commit-engine", "name": "State / Commit Engine", "summary": "Proposal/Patch/Correction/Commit；幂等；高风险确认。", "visual_group_id": "group-core", "x": 400, "y": 600},
+    {"id": "summary-system", "name": "Summary System", "summary": "Context Capsule 增量维护与父子树传播；Dirty Tracking。", "visual_group_id": "group-core", "x": 720, "y": 200},
+    {"id": "memory-fabric", "name": "Memory Fabric", "summary": "HOT/WARM/COLD 与可插拔 Memory Provider；派生可重建。", "visual_group_id": "group-derived", "x": 720, "y": 400},
+    {"id": "durable-task-runtime", "name": "Durable Task Runtime", "summary": "Reminder/Delayed/Scheduled/Resume；保证未来动作真实发生。", "visual_group_id": "group-derived", "x": 720, "y": 600},
+    {"id": "capability-registry", "name": "Capability Registry", "summary": "Native/MCP/External Tool Contract 与 Permission；预留长期能力。", "visual_group_id": "group-runtime", "x": 80, "y": 680},
+    {"id": "projection-layer", "name": "Projection Layer", "summary": "表格/Web/App 共享操作面；Canonical 不依赖具体表格产品。", "visual_group_id": "group-derived", "x": 1040, "y": 400},
+    {"id": "operations", "name": "Operations", "summary": "Diagnostics/Trace/Backup/Migration/Model Provider Config。", "visual_group_id": "group-derived", "x": 1040, "y": 600}
+  ],
+  "relations": [
+    {"source": "interaction-layer", "target": "agent-runtime", "relation_type": "produces_for"},
+    {"source": "agent-runtime", "target": "context-engine", "relation_type": "depends_on"},
+    {"source": "agent-runtime", "target": "capability-registry", "relation_type": "depends_on"},
+    {"source": "agent-runtime", "target": "state-commit-engine", "relation_type": "produces_for"},
+    {"source": "context-engine", "target": "personal-ledger-core", "relation_type": "depends_on"},
+    {"source": "context-engine", "target": "memory-fabric", "relation_type": "depends_on"},
+    {"source": "context-engine", "target": "summary-system", "relation_type": "depends_on"},
+    {"source": "state-commit-engine", "target": "personal-ledger-core", "relation_type": "produces_for"},
+    {"source": "state-commit-engine", "target": "source-evidence", "relation_type": "produces_for"},
+    {"source": "state-commit-engine", "target": "durable-task-runtime", "relation_type": "produces_for"},
+    {"source": "summary-system", "target": "personal-ledger-core", "relation_type": "depends_on"},
+    {"source": "memory-fabric", "target": "personal-ledger-core", "relation_type": "depends_on"},
+    {"source": "projection-layer", "target": "personal-ledger-core", "relation_type": "depends_on"},
+    {"source": "durable-task-runtime", "target": "personal-ledger-core", "relation_type": "references"},
+    {"source": "operations", "target": "agent-runtime", "relation_type": "related_to"},
+    {"source": "operations", "target": "personal-ledger-core", "relation_type": "related_to"},
+    {"source": "source-evidence", "target": "personal-ledger-core", "relation_type": "produces_for"}
+  ]
+}
