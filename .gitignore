@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+tmp_extract/
+*.sqlite
+*.sqlite3
+.pytest_cache/
