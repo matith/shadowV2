@@ -30,6 +30,19 @@
 3. 子黑盒 specs 为规划级摘要，详细验收可随实现再加深。
 4. 全部子黑盒 lifecycle=PLANNED，**未施工业务代码**。
 
-## 结论
+## 独立审核收边（对照 8a685d3 审阅，g000256）
 
-> 房屋图纸级规划已进入 canonical；P0 可开工「日常承诺」装修，但 Identity 硬门禁的原生 schema 与 template-v2 仍需补。
+| # | 审阅问题 | 处置 | 核实 |
+| --- | --- | --- | --- |
+| 1 | matter/event/people/knowledge 缺 contains | 已补 4 条 `personal-ledger-core contains` | contains **52→56** |
+| 2 | Directive 未闭环到执行方 | 补 `durable/capability/projection/agent-runtime → directive-policy-evaluator` | 4 条 depends_on |
+| 3 | 关键跨盒缺 Boundary Contract | 补 Durable→Commit、Capability→Source、两条 Policy 合同 | boundary **12→16** |
+| 4 | Plan/AC 无执行绑定 | `plan-p0/p1/p2-v2` 填 affected_module_ids（23/10/9）+ 4 条 module 级 AC binding | planning 查询可用 |
+| 5 | q-template-v2 blocking 与开工结论矛盾 | 标记 **RESOLVED / DEFERRED_NON_BLOCKING**，另开 `q-template-v2-deferred` blocking=false | 不再挡 P0 |
+| 6 | Identity RC 像已实现 | 新增 `rc-identity-gate-status`：**ACCEPTED_BUT_NOT_IMPLEMENTED** | 与 q-project-desc-api 一致 |
+
+**图快照：** 68 节点 / **91** 关系（contains 56, depends_on 13, produces_for 12, related_to 7, references 3）
+
+## 结论（修订）
+
+> 六项收边已完成并核实。在 **Identity 硬门禁仍 ACCEPTED_BUT_NOT_IMPLEMENTED** 的前提下，允许进入 P0 代码施工；不得宣称 Identity Gate 已落地。
