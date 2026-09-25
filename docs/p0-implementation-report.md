@@ -58,7 +58,7 @@ Runtime package `src/shiguang/` with BBM-aligned blackbox boundaries:
 ## Test results
 
 ```
-Ran 14 tests in ~1.3s
+Ran 18 tests in ~1.6s
 OK
 ```
 
@@ -66,6 +66,7 @@ OK
 - Boundary: commit atomicity, high-risk confirm, effect receipt, projection→commit
 - Scenario: A, C, E, restart recovery
 - Integration: nightly T0–T5
+- P1 slices (does not break P0): matter tree expand, archive mini-capsule recall, knowledge upsert
 
 See `docs/p0-test-output.txt` for deterministic output.
 
@@ -107,4 +108,7 @@ See `docs/p0-test-output.txt` for deterministic output.
 **READY_FOR_INDEPENDENT_AUDIT**
 
 P0 STATUS: **PASS**
-P1 STATUS: **NOT_STARTED**
+P1 STATUS: **PARTIAL** (matter tree expand, archive mini-capsule recall, knowledge ledger upsert — tested; File/Product ledgers, HOT/WARM/COLD, backup/migration not started)
+
+P0_BASELINE_ACCEPTED_FOR_AUDIT
+commit: a4a287f (P0) + this commit (P1 slices + report)
