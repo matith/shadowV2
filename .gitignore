@@ -13,4 +13,3 @@ tmp_audit_d/
 *.sqlite
 *.sqlite3
 .pytest_cache/
-index.html
