@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""state-commit-engine: sole write gate for ledgers.
+"""state-commit-engine: sole write gate for Canonical business state.
 
 Invariants:
+- State/Commit Engine owns the transaction boundary (ALL COMMIT or ALL ROLLBACK)
+- lower layers mutate only; they never durable-commit mid-batch
 - op_id idempotent
 - success only after durable commit
-- correction records old→new and invalidates interpretation
+- correction uses field whitelist; never f-string column names
+- correction invalidates old interpretations
 - high-risk ops require confirmation
 """
 from __future__ import annotations
@@ -26,6 +29,23 @@ from .types import (
     now_ms,
 )
 
+# Contract: correctable fields per target_kind. Illegal field → deterministic reject.
+CORRECTABLE_FIELDS = {
+    "matter": {"due_at", "due_label", "next_action", "status", "title", "priority"},
+    "reminder": {"status", "due_at", "title", "body", "next_action"},
+}
+
+# Fixed column map — no dynamic SQL identifiers from user/model input.
+REMINDER_COLUMNS = {
+    "status": "status",
+    "due_at": "due_at",
+    "title": "title",
+    "body": "body",
+    "next_action": "next_action",
+}
+
+MATTER_TOP_LEVEL = {"due_at", "status", "next_action", "title", "priority"}
+
 
 class OpValidator:
     REQUIRED = {
@@ -39,6 +59,11 @@ class OpValidator:
         OpKind.CANCEL_REMINDER.value: ["reminder_id"],
         OpKind.CORRECT_FIELD.value: ["target_kind", "target_id", "field", "new_value"],
         OpKind.ATTACH_FILE.value: ["matter_id", "filename"],
+        OpKind.UPSERT_KNOWLEDGE.value: ["topic", "content"],
+        OpKind.SET_MATTER_PARENT.value: ["matter_id"],
+        OpKind.ARCHIVE_MATTER.value: ["matter_id"],
+        OpKind.MARK_REMINDER_FIRED.value: ["reminder_id"],
+        OpKind.MARK_REMINDER_MISSED.value: ["reminder_id"],
     }
 
     def validate(self, op: LedgerOp) -> None:
@@ -54,6 +79,20 @@ class OpValidator:
         if op.kind in (OpKind.CREATE_REMINDER.value, OpKind.SNOOZE_REMINDER.value):
             if not isinstance(due, int) or due <= 0:
                 raise ValidationReject("due_at must be positive int ms", op.op_id)
+        if op.kind == OpKind.CORRECT_FIELD.value:
+            self._validate_correction(op)
+
+    def _validate_correction(self, op: LedgerOp) -> None:
+        p = op.payload
+        target_kind = p.get("target_kind")
+        field = p.get("field")
+        allowed = CORRECTABLE_FIELDS.get(target_kind)
+        if allowed is None:
+            raise ValidationReject(f"unknown target_kind: {target_kind}", op.op_id)
+        if field not in allowed:
+            raise ValidationReject(
+                f"field not correctable for {target_kind}: {field}", op.op_id
+            )
 
 
 class ChangeReceiptWriter:
@@ -61,6 +100,7 @@ class ChangeReceiptWriter:
         self.store = store
 
     def emit(self, receipt: ChangeReceipt) -> str:
+        # receipt is durable proof of a finished commit/reject — allow outside txn
         self.store.execute(
             "INSERT INTO change_receipts(receipt_id,commit_id,status,summary,old_to_new,matter_ref,created_at) VALUES(?,?,?,?,?,?,?)",
             (
@@ -86,6 +126,7 @@ class CorrectionApplier:
         self.source = source
 
     def apply(self, op: LedgerOp) -> dict:
+        self.store.require_transaction("CorrectionApplier.apply")
         p = op.payload
         target_kind = p["target_kind"]
         target_id = p["target_id"]
@@ -94,11 +135,14 @@ class CorrectionApplier:
         old_value = p.get("old_value")
         interp_id = p.get("interp_id")
 
+        if field not in CORRECTABLE_FIELDS.get(target_kind, set()):
+            raise ValidationReject(f"field not correctable for {target_kind}: {field}", op.op_id)
+
         if old_value is None:
             if target_kind == "matter":
                 m = self.matter.get(target_id)
                 if m:
-                    if field in m.get("fields", {}):
+                    if field in (m.get("fields") or {}):
                         old_value = m["fields"].get(field)
                     else:
                         old_value = m.get(field)
@@ -121,19 +165,52 @@ class CorrectionApplier:
                 now_ms(),
             ),
         )
+
+        invalidated = []
         if interp_id:
             self.source.mark_interpretation_invalid(interp_id)
+            invalidated.append(interp_id)
+        # Contract: correction must invalidate prior interpretations for this target
+        invalidated.extend(self._invalidate_active_interps(target_kind, target_id))
 
         changes = [{"field": field, "old": old_value, "new": new_value, "correction_id": correction_id}]
         if target_kind == "matter":
             self.matter.update_fields(target_id, {field: new_value})
         elif target_kind == "reminder":
+            col = REMINDER_COLUMNS[field]
             self.store.execute(
-                f"UPDATE reminders SET {field}=?, updated_at=? WHERE reminder_id=?",
+                f"UPDATE reminders SET {col}=?, updated_at=? WHERE reminder_id=?",
                 (new_value, now_ms(), target_id),
             )
-            self.store.commit()
-        return {"correction_id": correction_id, "old": old_value, "new": new_value, "changes": changes}
+        return {
+            "correction_id": correction_id,
+            "old": old_value,
+            "new": new_value,
+            "changes": changes,
+            "invalidated_interps": invalidated,
+        }
+
+    def _invalidate_active_interps(self, target_kind: str, target_id: str) -> list[str]:
+        rows = self.store.query(
+            "SELECT interp_id FROM interpretations WHERE status='ACTIVE' AND matter_id=?",
+            (target_id,),
+        )
+        out = []
+        for r in rows:
+            self.source.mark_interpretation_invalid(r["interp_id"])
+            out.append(r["interp_id"])
+        # also invalidate by source-linked interps when target is reminder
+        if target_kind == "reminder":
+            rows2 = self.store.query(
+                "SELECT interp_id FROM interpretations WHERE status='ACTIVE' AND kind='reminder'"
+            )
+            # only those that claim this reminder in fields
+            for r in rows2:
+                row = self.store.query_one("SELECT fields FROM interpretations WHERE interp_id=?", (r["interp_id"],))
+                if row and target_id in (row.get("fields") or ""):
+                    self.source.mark_interpretation_invalid(r["interp_id"])
+                    out.append(r["interp_id"])
+        return out
 
 
 class PatchCommitter:
@@ -150,12 +227,27 @@ class PatchCommitter:
         self.people = people
 
     def apply_op(self, op: LedgerOp) -> dict:
+        self.store.require_transaction("PatchCommitter.apply_op")
         p = op.payload
         kind = op.kind
         changes: list[dict] = []
         matter_id = op.matter_ref or p.get("matter_id")
 
         if kind == OpKind.CREATE_MATTER.value:
+            # identity: prefer reuse when similar open matter exists and not forced
+            if not p.get("force_new"):
+                sims = self.matter.find_similar(title=p["title"], person_name=(p.get("fields") or {}).get("person_name"))
+                if sims:
+                    mid = sims[0]["matter_id"]
+                    result = self.matter.update_fields(
+                        mid,
+                        p.get("fields") or {},
+                        next_action=p.get("next_action") or sims[0].get("next_action"),
+                        due_at=p.get("due_at") if p.get("due_at") is not None else ...,
+                    )
+                    changes.append({"field": "matter_id", "old": None, "new": mid, "reused": True})
+                    changes.extend(result["changes"])
+                    return {"changes": changes, "matter_id": mid, "reused": True}
             mid = self.matter.create(
                 title=p["title"],
                 status=p.get("status", "OPEN"),
@@ -178,6 +270,30 @@ class PatchCommitter:
             )
             changes.extend(result["changes"])
             matter_id = p["matter_id"]
+        elif kind == OpKind.SET_MATTER_PARENT.value:
+            result = self.matter.set_parent(p["matter_id"], p.get("parent_matter_id"))
+            changes.extend(result["changes"])
+            matter_id = p["matter_id"]
+        elif kind == OpKind.ARCHIVE_MATTER.value:
+            m = self.matter.get(p["matter_id"])
+            if not m:
+                raise ValidationReject("matter not found", op.op_id)
+            mini = p.get("mini_capsule") or {
+                "goal": m["title"],
+                "current": m.get("next_action") or m.get("status"),
+                "open_items": [],
+            }
+            fields = dict(m.get("fields") or {})
+            fields["archive"] = {
+                "archived_at": now_ms(),
+                "title": m["title"],
+                "status": m["status"],
+                "mini_capsule": mini,
+                "pointer": f"matter:{p['matter_id']}",
+            }
+            result = self.matter.update_fields(p["matter_id"], fields, status="ARCHIVED")
+            changes.extend(result["changes"])
+            matter_id = p["matter_id"]
         elif kind == OpKind.APPEND_EVENT.value:
             eid = self.event.append(
                 event_type=p.get("event_type", "note"),
@@ -196,9 +312,12 @@ class PatchCommitter:
                 tags=p.get("tags", []),
             )
             changes.append({"field": "person_id", "old": None, "new": pid})
+        elif kind == OpKind.UPSERT_KNOWLEDGE.value:
+            kid = self._upsert_knowledge(p, op.source_ref)
+            changes.append({"field": "knowledge_id", "old": None, "new": kid})
         elif kind == OpKind.CREATE_REMINDER.value:
-            rid = self._create_reminder(p)
-            changes.append({"field": "reminder_id", "old": None, "new": rid})
+            rid, created = self._create_or_reuse_reminder(p)
+            changes.append({"field": "reminder_id", "old": None, "new": rid, "created": created})
             matter_id = p["matter_id"]
         elif kind == OpKind.COMPLETE_REMINDER.value:
             rid = p["reminder_id"]
@@ -209,10 +328,8 @@ class PatchCommitter:
                 "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
                 (ReminderStatus.COMPLETED.value, now_ms(), rid),
             )
-            self.store.commit()
             changes.append({"field": "status", "old": row["status"], "new": ReminderStatus.COMPLETED.value})
             matter_id = row["matter_id"]
-            # durable complete must not write matter directly — only reminder state here.
         elif kind == OpKind.SNOOZE_REMINDER.value:
             rid = p["reminder_id"]
             row = self.store.query_one("SELECT * FROM reminders WHERE reminder_id=?", (rid,))
@@ -222,7 +339,6 @@ class PatchCommitter:
                 "UPDATE reminders SET status=?, due_at=?, updated_at=? WHERE reminder_id=?",
                 (ReminderStatus.SNOOZED.value, p["due_at"], now_ms(), rid),
             )
-            self.store.commit()
             changes.append({"field": "due_at", "old": row["due_at"], "new": p["due_at"]})
             matter_id = row["matter_id"]
         elif kind == OpKind.CANCEL_REMINDER.value:
@@ -234,8 +350,31 @@ class PatchCommitter:
                 "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
                 (ReminderStatus.CANCELLED.value, now_ms(), rid),
             )
-            self.store.commit()
             changes.append({"field": "status", "old": row["status"], "new": ReminderStatus.CANCELLED.value})
+            matter_id = row["matter_id"]
+        elif kind == OpKind.MARK_REMINDER_FIRED.value:
+            rid = p["reminder_id"]
+            row = self.store.query_one("SELECT * FROM reminders WHERE reminder_id=?", (rid,))
+            if not row:
+                raise ValidationReject("reminder not found", op.op_id)
+            if row["status"] == ReminderStatus.FIRED.value and row.get("last_fired_at"):
+                return {"changes": [], "matter_id": row["matter_id"], "already_fired": True, "reminder_id": rid}
+            self.store.execute(
+                "UPDATE reminders SET status=?, fire_count=fire_count+1, last_fired_at=?, updated_at=? WHERE reminder_id=?",
+                (ReminderStatus.FIRED.value, now_ms(), now_ms(), rid),
+            )
+            changes.append({"field": "status", "old": row["status"], "new": ReminderStatus.FIRED.value})
+            matter_id = row["matter_id"]
+        elif kind == OpKind.MARK_REMINDER_MISSED.value:
+            rid = p["reminder_id"]
+            row = self.store.query_one("SELECT * FROM reminders WHERE reminder_id=?", (rid,))
+            if not row:
+                raise ValidationReject("reminder not found", op.op_id)
+            self.store.execute(
+                "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
+                (ReminderStatus.MISSED.value, now_ms(), rid),
+            )
+            changes.append({"field": "status", "old": row["status"], "new": ReminderStatus.MISSED.value})
             matter_id = row["matter_id"]
         elif kind == OpKind.ATTACH_FILE.value:
             fid = new_id("file")
@@ -253,10 +392,23 @@ class PatchCommitter:
 
         return {"changes": changes, "matter_id": matter_id}
 
-    def _create_reminder(self, p: dict) -> str:
+    def _create_or_reuse_reminder(self, p: dict) -> tuple[str, bool]:
+        """Reminder identity = (matter_id, title, due_at) or collapse_key."""
+        collapse = p.get("collapse_key") or f"{p['matter_id']}:{p['title']}"
+        existing = self.store.query_one(
+            "SELECT reminder_id FROM reminders WHERE matter_id=? AND title=? AND due_at=? AND status != 'CANCELLED'",
+            (p["matter_id"], p["title"], p["due_at"]),
+        )
+        if existing:
+            return existing["reminder_id"], False
+        existing2 = self.store.query_one(
+            "SELECT reminder_id FROM reminders WHERE collapse_key=? AND status != 'CANCELLED'",
+            (collapse,),
+        )
+        if existing2:
+            return existing2["reminder_id"], False
         rid = new_id("rem")
         now = now_ms()
-        collapse = p.get("collapse_key") or f"{p['matter_id']}:{p['title']}"
         self.store.execute(
             "INSERT INTO reminders(reminder_id,matter_id,title,body,due_at,status,fire_count,last_fired_at,collapse_key,next_action,created_at,updated_at)"
             " VALUES(?,?,?,?,?,?,0,NULL,?,?,?,?)",
@@ -273,8 +425,23 @@ class PatchCommitter:
                 now,
             ),
         )
-        self.store.commit()
-        return rid
+        return rid, True
+
+    def _upsert_knowledge(self, p: dict, source_id: Optional[str]) -> str:
+        self.store.require_transaction("KnowledgeLedger.upsert")
+        existing = self.store.query_one("SELECT knowledge_id FROM knowledge WHERE topic=?", (p["topic"],))
+        if existing:
+            self.store.execute(
+                "UPDATE knowledge SET content=?, source_id=? WHERE knowledge_id=?",
+                (p["content"], source_id, existing["knowledge_id"]),
+            )
+            return existing["knowledge_id"]
+        kid = new_id("know")
+        self.store.execute(
+            "INSERT INTO knowledge(knowledge_id,topic,content,source_id,created_at) VALUES(?,?,?,?,?)",
+            (kid, p["topic"], p["content"], source_id, now_ms()),
+        )
+        return kid
 
 
 class StateCommitEngine:
@@ -298,7 +465,7 @@ class StateCommitEngine:
 
         applied: list[str] = []
         all_changes: list[dict] = []
-        matter_ref = None
+        matter_ids: set[str] = set()
         duplicates: list[str] = []
         pending: list[LedgerOp] = []
 
@@ -331,7 +498,9 @@ class StateCommitEngine:
                         result = self.patcher.apply_op(op)
                     changes = result.get("changes", [])
                     all_changes.extend(changes)
-                    matter_ref = result.get("matter_id") or matter_ref or op.matter_ref
+                    mid = result.get("matter_id") or op.matter_ref or op.payload.get("matter_id")
+                    if mid:
+                        matter_ids.add(mid)
                     self.store.execute(
                         "INSERT INTO op_log(op_id,kind,payload,result,commit_id,created_at) VALUES(?,?,?,?,?,?)",
                         (
@@ -349,16 +518,26 @@ class StateCommitEngine:
                     (commit_id, json.dumps(applied), None, now_ms()),
                 )
         except Exception as e:
-            # transaction rolled back; mark nothing as committed
+            # full rollback owned by transaction; emit durable REJECTED receipt
+            receipt = ChangeReceipt(
+                receipt_id=new_id("rcpt"),
+                commit_id=commit_id,
+                op_ids=[o.op_id for o in pending],
+                status="REJECTED",
+                summary=f"提交失败，已全部回滚：{e}",
+                old_to_new=[],
+                matter_ref=next(iter(matter_ids), None),
+            )
+            self.receipts.emit(receipt)
             raise CommitError(str(e)) from e
 
-        # dirty tracking for summary system
-        if matter_ref:
+        # dirty tracking for ALL matters in this batch (post durable commit)
+        for mid in matter_ids:
             self.store.execute(
                 "INSERT OR REPLACE INTO dirty_nodes(node_id,node_kind,marked_at) VALUES(?,?,?)",
-                (matter_ref, "matter", now_ms()),
+                (mid, "matter", now_ms()),
             )
-            self.store.commit()
+        self.store.commit()
 
         summary = self._summarize(all_changes, duplicates)
         receipt = ChangeReceipt(
@@ -368,7 +547,7 @@ class StateCommitEngine:
             status="COMMITTED",
             summary=summary,
             old_to_new=all_changes,
-            matter_ref=matter_ref,
+            matter_ref=next(iter(matter_ids), None),
         )
         self.receipts.emit(receipt)
         self.store.execute("UPDATE commits SET receipt_id=? WHERE commit_id=?", (receipt.receipt_id, commit_id))

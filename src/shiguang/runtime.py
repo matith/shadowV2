@@ -23,6 +23,7 @@ from .interaction import (
     MessageNormalizer,
 )
 from .ledgers import EventLedger, MatterLedger, PeopleLedger
+from .p1_slices import ArchiveLedger, KnowledgeLedger, MatterTree, P1WriteBridge
 from .projection import TableProjection
 from .source_evidence import SourceEvidenceService
 from .state_commit import StateCommitEngine
@@ -67,8 +68,14 @@ class ShiGuangApp:
         self.delivery_adapter = delivery or FakeDeliveryAdapter()
         self.delivery = DeliveryRouter(self.store, self.delivery_adapter, self.source)
         self.policy_eval = DirectivePolicyEvaluator(self.store, self.clock)
-        self.durable = DurableTaskRuntime(self.store, self.clock, self.policy_eval)
+        self.durable = DurableTaskRuntime(
+            self.store,
+            self.clock,
+            self.policy_eval,
+            commit_ops=self.commit.commit_ops,
+        )
         self.projection = TableProjection(self.store, self.matter, self.commit)
+        self.p1_bridge = P1WriteBridge(self.commit.commit_ops)
         self._user_ref = "user_default"
 
     # ---------- lifecycle ----------
@@ -83,13 +90,42 @@ class ShiGuangApp:
     def ingest_text(self, text: str, *, channel: str = "fake", user_ref: str = "user") -> dict:
         raw = self.inbound.push(user_ref, text)
         raw["channel"] = channel
+        # use controllable clock so replay bucket is deterministic under FakeClock
+        raw["ts"] = self.clock.now()
         env = self.normalizer.normalize(raw)
+
+        # input-level idempotency: same message_id is a replay
+        prior = self.store.query_one("SELECT * FROM message_inbox WHERE message_id=?", (env.message_id,))
+        if prior:
+            return {
+                "turn_id": prior.get("turn_id"),
+                "source_id": None,
+                "intent": "replay",
+                "extract": {},
+                "reply": "重复消息，已忽略。",
+                "receipt": ChangeReceipt(
+                    receipt_id=prior.get("receipt_id") or "dup",
+                    commit_id="dup",
+                    op_ids=[],
+                    status="DUPLICATE",
+                    summary="输入重放，未重复记账",
+                    old_to_new=[],
+                ),
+                "delivery": {"delivered": False, "reason": "REPLAY"},
+                "ops": [],
+                "message_id": env.message_id,
+                "replay": True,
+            }
+
         self.channel_identity.map_user(channel, user_ref)
         source_id = self.source.raw.store_from_envelope(env)
         env.raw_source_id = source_id
 
+        # ledger routing is advisory (soft), recorded on the turn meta
+        route = self.ledger_router.route(env.text)
+
         turn = self.turns.run_turn(env, now_ms=self.clock.now())
-        # resolve placeholder matter ids in reminder ops after create
+        turn.meta["ledger_route"] = route
         ops = self._resolve_ops(turn.ops, turn)
 
         receipt = self.commit.commit_ops(ops) if ops else ChangeReceipt(
@@ -101,23 +137,23 @@ class ShiGuangApp:
             old_to_new=[],
         )
 
-        # interpretation record
+        # interpretation record (source-linked)
+        interp_id = None
         if turn.meta.get("intent"):
+            interp_id = f"interp_{turn.turn_id}"
             self.source.provenance.record_interpretation(
-                interp_id=f"interp_{turn.turn_id}",
+                interp_id=interp_id,
                 source_id=source_id,
                 kind=str(turn.meta.get("intent")),
                 fields=turn.meta.get("extract") or {},
                 matter_id=receipt.matter_ref or (turn.meta.get("extract") or {}).get("matter_id"),
             )
 
-        # post-commit summary sync
-        if receipt.matter_ref:
-            self.summary.sync_with_matter(receipt.matter_ref)
+        # post-commit summary sync for every dirty matter
+        self.summary.process_dirty()
 
         reply_text = turn.reply
         if ops and receipt.status == "COMMITTED":
-            # success wording only after commit
             if not reply_text:
                 reply_text = "已保存。"
         delivery = self.delivery.deliver(
@@ -127,6 +163,20 @@ class ShiGuangApp:
             channel=channel,
             matter_ref=receipt.matter_ref,
         )
+        self.store.execute(
+            "INSERT INTO message_inbox(message_id,channel,user_ref,text_hash,turn_id,receipt_id,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                env.message_id,
+                channel,
+                user_ref,
+                source_id,
+                turn.turn_id,
+                receipt.receipt_id,
+                "PROCESSED",
+                now_ms(),
+            ),
+        )
+        self.store.commit()
         return {
             "turn_id": turn.turn_id,
             "source_id": source_id,
@@ -136,6 +186,9 @@ class ShiGuangApp:
             "receipt": receipt,
             "delivery": delivery,
             "ops": [o.to_dict() for o in ops],
+            "message_id": env.message_id,
+            "replay": False,
+            "interp_id": interp_id,
         }
 
     def _resolve_ops(self, ops, turn) -> list:

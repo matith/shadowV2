@@ -1,0 +1,684 @@
+任务：shadowV2 独立审计整改 —— 逐项复核 Finding，并从底层不变量开始整改
+
+仓库：
+matith/shadowV2
+
+审计基线：
+HEAD = 2db5e17
+P0 checkpoint = a4a287f
+原始架构基线 = b167253 / g000256
+当前 BBM canonical = g000259 或其合法后继 generation
+
+当前独立审计结论：
+
+F-001 P0：多操作 commit 非原子
+F-002 P0：Correction.field 存在动态 SQL / 非法字段写入问题
+
+F-003～F-007 P1：
+- Reminder 重复语义
+- P1 路径绕过 State/Commit
+- 缺少 message replay / 输入级幂等
+- Directive 优先级/执行语义问题
+- 测试覆盖不足
+
+F-008～F-010 P2
+
+Claim Verification：
+- 18 tests：VERIFIED
+- Scenario A/E：VERIFIED
+- T0–T5：VERIFIED
+- Source immutable：VERIFIED
+- No false success：VERIFIED
+- Reminder restart/idempotency：VERIFIED
+- Evidence chain：VERIFIED
+- P0 regression：VERIFIED
+
+但：
+- Scenario C：PARTIAL
+- State/Commit 唯一写：PARTIAL
+- 同 Matter 收敛：PARTIAL
+- Runtime Identity：PARTIAL
+
+独立审计最终：
+P0 = FAIL
+P1 = PARTIAL_WITH_FINDINGS
+Overall = RETURN_TO_EXECUTOR
+
+
+━━━━━━━━━━━━━━━━━━
+一、不要把审计报告当成修改指令
+━━━━━━━━━━━━━━━━━━
+
+审计 Finding 是“待验证的问题陈述”，不是绝对真相。
+
+对 F-001 ～ F-010 逐项：
+
+1. 阅读审计证据；
+2. 阅读对应 BBM BlackBox Spec；
+3. 阅读直接 Boundary / Relation；
+4. 阅读相关 Acceptance；
+5. 阅读当前实现和测试；
+6. 必要时构造最小 deterministic reproduction；
+7. 给 Finding 标记：
+
+CONFIRMED
+REJECTED
+OBSOLETE
+DUPLICATE
+RECLASSIFIED
+
+禁止看到 Finding 就直接改代码。
+
+尤其不要为了让审计测试通过而增加特殊 case。
+
+
+━━━━━━━━━━━━━━━━━━
+二、先判断：BBM 错，还是实现错
+━━━━━━━━━━━━━━━━━━
+
+每个 CONFIRMED Finding 必须先回答：
+
+A. BBM 已经正确规定预期行为，只是代码没有实现？
+→ Implementation Bug
+→ 不修改架构，按 BBM 修实现。
+
+B. 按当前 BBM 正确实现，仍然无法满足产品用途 / Acceptance？
+→ Architecture / Contract Defect
+→ 先做最小 BBM 修订
+→ 再修改代码。
+
+C. 多个 Finding 是否来自同一个底层缺陷？
+→ 不允许分别打补丁。
+→ 找共同根因，从最低层修一次。
+
+
+━━━━━━━━━━━━━━━━━━
+三、整改顺序不是按 Finding 编号，而是按依赖层级
+━━━━━━━━━━━━━━━━━━
+
+第一层：Canonical Write / Transaction Foundation
+
+优先处理：
+
+F-001 多操作 Commit 非原子
+F-002 Correction.field
+
+重点检查：
+
+- Store.transaction 的真实事务语义
+- StateCommitEngine.commit_ops
+- Ledger 内部是否自行 commit
+- CorrectionApplier
+- PatchCommitter
+- ChangeReceiptWriter
+- dirty tracking
+- reminder mutation
+- people / matter / event mutation
+
+目标：
+
+一个 State/Commit transaction 内的所有业务 mutation 必须满足：
+
+ALL COMMIT
+或
+ALL ROLLBACK
+
+下层组件不得在 State/Commit transaction 尚未结束时自行提前 commit。
+
+不要只删除几个 commit() 就结束。
+需要明确事务 ownership：
+
+State/Commit Engine 是事务 owner；
+下层 Ledger / Applier 在事务内只能执行 mutation；
+最终 durable commit 由统一事务边界负责。
+
+同时确认：
+- receipt 什么时候生成
+- dirty marker 什么时候写
+- op_log / commits 什么时候写
+- 失败时这些东西是否全部保持一致
+- crash / exception 中途是否可能留下半提交状态
+
+Correction.field 不允许继续接受任意字段后拼接 SQL。
+
+应从数据模型/Contract 层明确：
+- target_kind
+- 每种 target_kind 可纠正字段白名单
+- 字段对应的更新路径
+- 非法字段 deterministic reject
+
+不要只做字符串过滤。
+
+
+第二层：Canonical Write Path / Idempotency
+
+底层事务稳定后，再处理：
+
+- F-004 P1 绕过 State/Commit
+- message replay
+- 同一输入重放
+- op_id 幂等
+- 同 Matter 收敛
+
+重新扫描所有业务状态写入。
+
+BBM 已确认：
+Canonical 业务唯一写入口 = State/Commit Engine。
+
+所以要区分：
+
+基础设施状态 / transport metadata
+与
+Canonical business state
+
+不能机械地把 SQLite 所有 INSERT/UPDATE 都塞进 State/Commit。
+
+但凡属于：
+Matter
+Event
+People
+Reminder
+Correction
+以及 BBM 定义的其他 Canonical business state
+
+必须遵守唯一写路径。
+
+检查是否仍存在：
+Runtime / Durable / Projection / Provider / P1 feature
+直接修改 Canonical state。
+
+
+第三层：Reminder / Durable / Directive
+
+再处理：
+
+F-003 Reminder duplicate
+F-006 Directive priority / enforcement
+
+重点不是“某个测试能过”，而是定义清楚：
+
+创建提醒的 identity 是什么？
+重复输入如何判断同一个 reminder？
+delivery collapse 与 reminder identity 是否被错误混为一谈？
+restart 后如何保证不重复执行？
+snooze / complete / cancel 是否都回到 State/Commit？
+Directive 在 reminder fire / delivery 前的确定执行位置在哪里？
+多个 Directive 冲突时谁优先？
+
+这些必须和 BBM Contract 对齐。
+
+
+第四层：Context / Scenario C / Matter convergence
+
+前面底层不变量稳定后，再重新检查：
+
+Scenario C
+同 Matter 收敛
+Working Context
+Ledger Router
+多轮事项 continuation
+
+不要先靠关键词 heuristic 增加特殊 case。
+
+如果：
+
+“补充一下……”
+“刚才那个……”
+“李经理那个合同……”
+
+之类 continuation 只能靠测试句子的关键词碰巧命中，
+则继续向 Matter identity / retrieval / context contract 下钻。
+
+目标不是通过固定 fixture，
+而是让“已有 Matter 的多轮继续”成为系统能力。
+
+
+第五层：Tests / Audit Closure
+
+F-007 不要单独理解成“多写几个测试”。
+
+前四层整改完成以后补：
+
+1. Transaction rollback fault injection
+2. multi-op partial failure
+3. Correction illegal field
+4. Correction wrong target_kind
+5. same message replay
+6. same op replay
+7. duplicate reminder
+8. restart + reminder fire
+9. directive conflict / suppression
+10. Scenario C multi-turn convergence
+11. canonical write bypass detection
+
+然后重新完整跑：
+
+Scenario A
+Scenario C
+Scenario E
+T0–T5
+P0 regression
+P1 related regression
+
+
+━━━━━━━━━━━━━━━━━━
+四、F-008～F-010 暂时不要抢修
+━━━━━━━━━━━━━━━━━━
+
+先确认、记录。
+
+除非它们实际上是 P0/P1 根因，否则不得因为顺手而扩大整改范围。
+
+本轮优先目标：
+
+P0 FAIL
+→ P0 PASS candidate
+
+P1 PARTIAL_WITH_FINDINGS
+→ P1 findings closed / explicitly deferred
+
+不要进入新的 P2 产品开发。
+
+
+━━━━━━━━━━━━━━━━━━
+五、BBM 纪律
+━━━━━━━━━━━━━━━━━━
+
+这轮尤其禁止“发现即修”。
+
+每个问题：
+
+Finding
+→ 对照 BBM
+→ 判断 Contract 是否正确
+→ Contract 正确：修实现
+→ Contract 错误：先最小修 BBM
+→ 再修实现
+→ deterministic verification
+→ evidence 写回
+
+如果一个底层修复同时解决 F-001、F-004、F-003 的部分问题，
+应记录为共同 root cause，不要伪装成三个互相独立的 patch。
+
+
+━━━━━━━━━━━━━━━━━━
+六、执行过程不要频繁停下来问用户
+━━━━━━━━━━━━━━━━━━
+
+普通：
+Bug
+测试失败
+事务实现
+schema 修正
+测试 fixture
+内部重构
+BBM 与实现对齐
+
+均自行继续。
+
+只有以下情况停止：
+
+1. 必须改变用户已经确认的产品核心用途；
+2. 必须扩大 P0/P1 产品范围；
+3. 当前 BBM 出现两个无法自行裁决的顶层产品方向；
+4. 需要真实外部高风险操作。
+
+
+━━━━━━━━━━━━━━━━━━
+七、最终交付
+━━━━━━━━━━━━━━━━━━
+
+最终不要只报告“tests pass”。
+
+输出一张整改矩阵：
+
+Finding
+Original Severity
+Verification
+Root Cause
+BBM Change
+Implementation Change
+Tests
+Evidence
+Final Status
+
+并明确：
+
+哪些 Finding 被确认；
+哪些被推翻；
+哪些实际上共享根因；
+哪些修改了 BBM；
+哪些只是实现偏离；
+P0 是否重新具备独立审计条件；
+P1 是否还有 blocker。
+
+最终状态最多写：
+
+READY_FOR_REAUDIT
+
+不要自行写 FINAL PASS。
+
+完成后：
+- 更新 BBM implementation / verification evidence
+- 建立清晰 Git checkpoint
+- push
+- 工作区保持干净
+- 给出最终 commit SHA
+- 给出新的 BBM canonical generation
+
+
+以下是审计原文：
+Auditor A/D/E/F 已返回。继续等 B、C 收口后汇总完整矩阵。
+
+Auditor B 已收口。还差 C（Ledger/Source），等它完成后出最终矩阵。
+
+6 个子审计全部返回。正在收敛为完整黑箱完成度报告（Markdown，不生成 HTML）。
+
+# INDEPENDENT BLACKBOX AUDIT
+
+**HEAD:** `2db5e17`（与上一轮 Final HEAD 一致，未前进）
+**BBM:** `g000259`（baseline 接受 `g000256`；`5ab7623` 为 plan-p0-v3 执行闭包，非架构重写）
+**P0 PLAN:** `plan-p0-v3`（35 affected modules）
+**P1 PLAN:** `plan-p1-v2`（10 bound modules）
+**方法:** 6 个只读子审计（A Interaction/Runtime · B Context/Directive · C Ledger/Source · D State/Commit/Summary · E Durable/Projection · F P1）+ 主审计跨边核对与写路径汇总。产品代码与 BBM 未改。
+
+---
+
+## 1. Executive Verdict
+
+| 项 | 结论 |
+|---|---|
+| **P0** | **FAIL** — 功能闭环 fixture 可跑，但架构核心（唯一写入口、多 op 原子性、Correction 安全）不成立 |
+| **P1** | **PARTIAL_WITH_FINDINGS** — 3/10 有切片，且两处绕过 State/Commit |
+| **Overall** | **RETURN_TO_EXECUTOR** |
+
+> 判定原则：不按「项目能跑」判完成；按「该黑箱职责是否真实存在、是否在真实路径、是否有独立证据」判定。
+> 「有 Python 文件」≠ IMPLEMENTED；「18 tests 全绿」≠ VERIFIED。
+
+---
+
+## 2. Critical Findings
+
+| ID | 级 | 问题 | 证据 |
+|---|---|---|---|
+| **F-001** | P0 | **多 op Commit 非原子**。`ledgers.py` 写方法内嵌 `store.commit()`，与 `store.transaction()` 冲突；失败后 matter 留下、op_log 回滚 → 半提交，且同 op_id 重试 UNIQUE 崩溃 | Auditor D 探针：`[CREATE m_a, UPDATE 不存在]` → CommitError 但 `m_a` 仍在 |
+| **F-002** | P0 | **Correction field 拼 SQL**。`state_commit.py:132` f-string 列名；reminder 路径可污染任意列 | `field="title='POISON', status"` → title/status 被改写，receipt 仍 COMMITTED |
+| **F-004** | P0 | **写入口非唯一**。`dec-source-write` 要求唯一写入口，工程无门禁 | `MatterLedger.create` 可直调无 op_log；P1 `set_parent`/`knowledge.upsert` 裸 SQL |
+| **F-011** | P0 | **纠正永不失效旧解释**。proposer 的 `correct_field` 从不填 `interp_id` → `mark_invalid` 生产路径 0 命中 | 4 次纠正后 interpretations 全 ACTIVE |
+| **F-003** | P1 | 同文连说两次 → **双 Reminder / 双投递**（Matter 收敛但 reminder 无去重） | probe: `n_reminders=2`，collapse 键含 `reminder_ref` 不合并 |
+| **F-005** | P1 | `message_id` 每次 `new_id`，不参与幂等；无入站重放闸 | `interaction.py:34` |
+| **F-006** | P1 | Directive 优先级 bug：`and`/`or` 混用使 `hour<8` 误伤非 notification（潜伏） | `durable_task.py:96`；72 组合 16 mismatch |
+| **F-013** | P1 | 多事项批次 **dirty 只标最后一个** `matter_ref` | `state_commit.py:356-360` |
+| **F-014** | P1 | **LedgerRouter 死代码**（假完成模式 C）：keyword if 且 `route()` 全仓 0 调用 | `runtime.py:58` 仅构造 |
+| **F-017** | P1 | `mark_fired` 先于 policy → defer 也 `fire_count++` | `durable_task.py:175` vs `:189` |
+| **F-016** | P1 | effect-receipt `INSERT OR REPLACE` + 无 external_ref 校验（模式 D 可注入/可篡改） | 伪造 receipt 可入库 |
+| **F-012** | P1 | `find_similar` 实现了但创建路径 **零调用**，Matter 去重验收不可过 | rg 仅定义处 |
+
+---
+
+## 3. P0 Blackbox Completion Matrix（35 affected modules）
+
+状态词表：`PLANNED_ONLY` / `STUB` / `IMPLEMENTED_PARTIAL` / `IMPLEMENTED` / `VERIFIED` / `BLOCKED` / `NOT_IN_SCOPE`
+
+| Parent | Blackbox | Expected responsibility | Implementation | Tests | Independent probe | Status | Conf | Finding |
+|---|---|---|---|---|---|---|---|---|
+| Interaction | interaction-layer | 统一入口/出口，防失忆丢件 | `interaction.py`+`runtime` 装配 | 间接 | 路径插桩命中 | IMPLEMENTED_PARTIAL | 高 | — |
+| Interaction | inbound-message-gateway | 鉴权/限流/原始投递确认 | 仅 `FakeInboundChannel` 列表 | 无 | 职责 0 实现 | **STUB** | 高 | F-020 |
+| Interaction | message-normalizer | raw→MessageEnvelope | `normalize()` | 间接 | message_id 每次新 | IMPLEMENTED_PARTIAL | 高 | F-005 |
+| Interaction | delivery-router | 选路/去重/补送/回执 | `DeliveryRouter`+Fake | T3 | collapse/resend/effect 通过 | **VERIFIED** | 高 | — |
+| Interaction | channel-identity-mapping | 跨渠道 Principal | `map_user/rebind/unbind` | 无专测 | principal 下游被丢弃 | IMPLEMENTED_PARTIAL | 高 | B3 |
+| Agent | agent-runtime | 可替换模型循环 | 无 tool-invoker | T0–T5 | 8 类命中，ToolInvoker=0 | IMPLEMENTED_PARTIAL | 高 | — |
+| Agent | model-adapter | 多 Provider/可替换 | `ModelAdapter`+`RuleBasedModel` | fixture | 近义中文/英文全灭 | IMPLEMENTED_PARTIAL | 高 | F-010 |
+| Agent | turn-orchestrator | 单轮理解-ops-回复 | `run_turn` | 全场景 | compile→model→propose | **VERIFIED** | 高 | — |
+| Agent | ledger-ops-proposer | 意图→幂等 LedgerOps | `propose()` | 间接 | op_id 恒 new_id；不标 high | IMPLEMENTED_PARTIAL | 高 | F-005 |
+| Context | context-engine | 本次可见 + 写入路由 | 三件套塞两文件 | 间接 | 部分接入 | IMPLEMENTED_PARTIAL | 高 | — |
+| Context | working-context-compiler | 预算组装可解释上下文 | `compile()` 每 turn 必经 | 间接 | **假完成 A 不成立** | IMPLEMENTED_PARTIAL | 高 | — |
+| Context | ledger-router | 多账本扇出 | keyword if | **0** | `route()` 0 调用 | **STUB** | 高 | F-014 |
+| Context | directive-policy-evaluator | Directive 统一裁决 | 两套：读表死代码 + 硬编码 fire 路径 | 无 defer 测 | 优先级 bug | IMPLEMENTED_PARTIAL | 高 | F-006 |
+| Ledger | personal-ledger-core | Matter/Event/People 所有权 | 三类分离 | A/C/E | 写门禁缺失 | IMPLEMENTED_PARTIAL | 高 | F-004 |
+| Ledger | matter-ledger | 事项状态/revision | `MatterLedger` | 间接 | find_similar 未接 | IMPLEMENTED_PARTIAL | 高 | F-012 |
+| Ledger | event-ledger | 追加式事件 | 仅 append | 间接 | 无 UPDATE API | **VERIFIED** | 高 | — |
+| Ledger | people-ledger | 人员 upsert | 精确 name 去重 | 间接 | 同名合并通过 | IMPLEMENTED_PARTIAL | 中 | — |
+| Source | source-evidence | 原文/解释/效果证据伞 | 组合 raw+prov+effect | E | 纠正不改 Source | IMPLEMENTED_PARTIAL | 高 | — |
+| Source | raw-source-store | 原文不可变 | 仅 INSERT API | Source 不可变 | SQL 层可 UPDATE | IMPLEMENTED_PARTIAL | 高 | — |
+| Source | provenance-chain | 解释链/失效 | 有 mark_invalid | 间接 | **生产路径 0 失效** | IMPLEMENTED_PARTIAL | 高 | **F-011** |
+| Source | effect-receipt-store | 外部效果可追踪 | `attach()` | boundary | 可伪造/可覆盖 | IMPLEMENTED_PARTIAL | 高 | F-016 |
+| Commit | state-commit-engine | 唯一业务写入口+原子 | `commit_ops` | partial | **半提交 REPRODUCED** | IMPLEMENTED_PARTIAL | 高 | **F-001** |
+| Commit | op-validator | Op 校验 | 必填+due 正整数 | 间接 | 无 field 白名单 | IMPLEMENTED_PARTIAL | 高 | F-002 |
+| Commit | patch-committer | Op→Ledger 落库 | 全 kind 分发 | 间接 | 内层 commit 破坏事务 | IMPLEMENTED_PARTIAL | 高 | F-001 |
+| Commit | correction-applier | 纠正不动 Source | 有 corrections 表 | E | reminder SQL 注入 | IMPLEMENTED_PARTIAL | 高 | **F-002** |
+| Commit | change-receipt | 成功/失败回执 | COMMITTED/DUPLICATE | boundary | 失败无 REJECTED | IMPLEMENTED_PARTIAL | 高 | — |
+| Summary | summary-system | Capsule 同步 | `sync_with_matter` | A/C | 真增量名不副实 | IMPLEMENTED_PARTIAL | 高 | — |
+| Summary | dirty-tracker | 脏标记 | mark/clear 正确 | 间接 | **多事项漏标** | IMPLEMENTED_PARTIAL | 高 | F-013 |
+| Summary | incremental-reducer | 增量合并 | dict merge | 间接 | 无列表合并 | **IMPLEMENTED** | 中 | — |
+| Summary | capsule-store | 摘要存储 | get/upsert | A/C | basis_revision 正确 | **IMPLEMENTED** | 高 | — |
+| Durable | durable-task-runtime | 到期执行闭环 | `run_due` | A/T3 | resume/delayed 缺 | IMPLEMENTED_PARTIAL | 高 | — |
+| Durable | reminder-scheduler | due scan/fire | mark_fired+status 过滤 | A | already_fired 死条件 | IMPLEMENTED_PARTIAL | 高 | F-018 |
+| Durable | task-action-bridge | 用户动作→Ops | complete/snooze 只产 Op | bridge 测 | **不直写 Matter** | **VERIFIED** | 高 | — |
+| Durable | delayed-scheduled-runner | 延时调度 | **无类无路径** | 0 | 符号 0 命中 | **PLANNED_ONLY** | 高 | — |
+| Projection | projection-layer | 人机同态视图 | 仅 TableProjection | 间接 | — | IMPLEMENTED_PARTIAL | 高 | — |
+| Projection | table-projection | 表格 Inspector | render/edit/export | projection 测 | edit→Commit | **VERIFIED** | 高 | — |
+
+**BBM contains 子黑箱（不在 35 affected 内，但应知悉）：**
+
+| Child | Parent | Status | 说明 |
+|---|---|---|---|
+| tool-invoker | agent-runtime | **PLANNED_ONLY** | 零代码零调用 |
+| conflict-resolver | state-commit-engine | **PLANNED_ONLY** | 零代码 |
+| attachment-store | source-evidence | **STUB** | hex-in-kv，`bytes_path` 死指针 |
+| source-versioning | source-evidence | **PLANNED_ONLY** | 无版本类 |
+| context-budget-policy | context-engine | **STUB** | 仅 `budget_items=8` 截断 |
+| memory-retriever | context-engine | **PLANNED_ONLY** | 无源码 |
+| task-resume | durable-task-runtime | **PLANNED_ONLY** | 无源码 |
+| edit-to-patch-adapter | projection-layer | **PLANNED_ONLY** | 功能被 `apply_cell_edit` 内联 |
+| web-projection | projection-layer | **PLANNED_ONLY** | 无绑定 |
+
+---
+
+## 4. P1 Blackbox Completion Matrix（plan-p1-v2 · 10 bound）
+
+| Bound | Status | 实现物 | Finding |
+|---|---|---|---|
+| personal-ledger-core（树切片） | **IMPLEMENTED_PARTIAL** | `MatterTree` set_parent/children/expand | F-004 裸 SQL 旁路 |
+| archive-ledger | **IMPLEMENTED_PARTIAL** | mini-capsule + recall | 经 `update_fields` 仍非 commit_ops 全链路 |
+| knowledge-ledger | **IMPLEMENTED_PARTIAL** | upsert/search | F-004 裸写 knowledge |
+| summary-system（P1 增量） | **PLANNED_ONLY** | 子→父脏传播未做 | F-013 关联 |
+| product-ledger | **PLANNED_ONLY** | — | — |
+| file-ledger | **PLANNED_ONLY** | ATTACH_FILE 仅 fields.files stub | ≠ file-ledger 语义 |
+| memory-fabric | **PLANNED_ONLY** | — | — |
+| operations | **PLANNED_ONLY** | 备份/迁移/诊断全无 | — |
+| tree-propagator | **PLANNED_ONLY** | MatterTree ≠ tree-propagator | 职责是脏传播 |
+| hot-warm-cold-tier | **PLANNED_ONLY** | — | — |
+
+**P1 STATUS: PARTIAL — implemented 3 / 10（均未达 VERIFIED）**
+
+---
+
+## 5. Parent Blackbox Summary
+
+| Parent | children（本阶段） | 通过/合计 | Parent status |
+|---|---|---|---|
+| Interaction Layer | inbound · normalizer · delivery · channel-id | 1 VERIFIED / 4 | IMPLEMENTED_PARTIAL |
+| Agent Runtime | model · turn · tool-invoker · ops-proposer | 1 VERIFIED / 4（tool-invoker 空） | IMPLEMENTED_PARTIAL |
+| Context Engine | working-ctx · ledger-router · budget · memory-retriever · directive | 0 VERIFIED / 5 | IMPLEMENTED_PARTIAL |
+| Personal Ledger Core | matter · event · people（+P1 tree/archive/knowledge） | 1 VERIFIED / 3 P0 | IMPLEMENTED_PARTIAL |
+| Source & Evidence | raw · provenance · effect · attachment · versioning | 0 VERIFIED / 5 | IMPLEMENTED_PARTIAL |
+| State Commit Engine | validator · patch · correction · receipt · conflict | 0 VERIFIED / 5 | IMPLEMENTED_PARTIAL |
+| Summary System | dirty · reducer · capsule · tree-propagator | 0 VERIFIED / 4 | IMPLEMENTED_PARTIAL |
+| Durable Task Runtime | scheduler · delayed · bridge · resume | 1 VERIFIED / 4 | IMPLEMENTED_PARTIAL |
+| Projection Layer | table · edit-to-patch · web | 1 VERIFIED / 3 | IMPLEMENTED_PARTIAL |
+
+---
+
+## 6. Write Path Matrix
+
+| writer | state | through commit? | allowed? | evidence |
+|---|---|---|---|---|
+| `StateCommitEngine.commit_ops` → Patch/Correction | matters/events/people/reminders/corrections | ✅ CANONICAL | ✅ | `state_commit.py:295-376` |
+| `MatterLedger.create/update_fields` | matters | 可被直调 | ⚠️ 无门禁 | probe 无 op_log 建 matter |
+| `EventLedger.append` | events | 同上 | ⚠️ | `ledgers.py:158-186` |
+| `PeopleLedger.upsert` | people | 同上 | ⚠️ | `ledgers.py:203-220` |
+| `PatchCommitter` reminder 写 | reminders | 引擎内但内层 commit | ⚠️ | F-001 共犯 |
+| `ReminderScheduler.mark_fired/missed` | reminders 运行时态 | ❌ | 灰区 | `durable_task.py:54-82` |
+| `DurableTaskRuntime` defer | reminders | ❌ | 灰区 | `:195-199` |
+| `MatterTree.set_parent` | matters.parent_matter_id | ❌ **违规** | ❌ | `p1_slices.py:22-26` |
+| `KnowledgeLedger.upsert` | knowledge | ❌ **违规** | ❌ | `p1_slices.py:110-125` |
+| `ArchiveLedger.archive` | matters via update_fields | ❌ 半旁路 | ⚠️ | `p1_slices.py:81` |
+| `SummarySystem` capsule/dirty | capsules/dirty_nodes | 派生态 post-commit | ✅ | `summary_system.py` |
+| `DeliveryRouter` | deliveries + effect | 边界 | ✅ | `interaction.py:131-157` |
+| `ChannelIdentityMapping` | channel_identities | 边界 | ✅ | `interaction.py:56-75` |
+| `_Txn.__exit__` | `_conn.commit()` | 绕过 `Store.commit` | ⚠️ | `storage.py:256` |
+
+**CANONICAL_WRITE_PATH: FAIL**（F-001/F-004）
+
+---
+
+## 7. Boundary Conformance Matrix
+
+| Boundary | Expected | Actual | Verdict |
+|---|---|---|---|
+| Interaction → Runtime | MessageEnvelope → Turn | ✅ ingest→turn | PASS |
+| Runtime → Context | 每 turn compile | ✅ `agent_runtime.py:466` | PASS |
+| Runtime → Commit | ops 唯一进 commit | ✅ 主路径 | PASS（旁路另计） |
+| Commit → Ledger | 经 PatchCommitter | ✅ 但内层 commit | **FAIL** 原子性 |
+| Commit → Summary | dirty→capsule | ⚠️ 多事项漏标 | PARTIAL |
+| Commit ↔ Durable | bridge 产 Op → commit | ✅ 不直写 Matter | PASS |
+| Durable → Policy → Delivery | fire 前裁决 | ⚠️ mark_fired 先于 policy | PARTIAL |
+| Projection → Commit | edit→UPDATE_MATTER | ✅ | PASS |
+| Effect Receipt | 可追踪 external | ⚠️ 可伪造/可覆盖 | PARTIAL |
+| Ledger → Context → restart | canonical 恢复 | ✅ T5/restart 测通过 | PASS |
+
+**BYPASSED / DEAD:** LedgerRouter · DirectivePolicy（读表）· tool-invoker · conflict-resolver · delayed-runner · task-resume · edit-to-patch · web-projection · source-versioning · memory-retriever
+
+---
+
+## 8. Test Coverage Matrix
+
+现有 **18 tests**（独立复跑 OK / 1.5–5s）：
+
+| Blackbox | Existing Test | Independent Probe | Failure Path | Status |
+|---|---|---|---|---|
+| delivery-router | T3 collapse/effect | A/E probe | fail→resend | 覆盖较好 |
+| turn-orchestrator | 全场景 | A 插桩 | query 兜底 | 覆盖 |
+| state-commit-engine | duplicate op | D 半提交 | **失败路径缺** | **不足** |
+| correction-applier | Scenario E | D 注入 / C interp | **注入未测** | **不足** |
+| raw-source-store | Source 不可变 | C SQL 改写 | 弱 | 部分 |
+| provenance-chain | 间接 | **F-011 失效 0** | 无 | **不足** |
+| task-action-bridge | complete 测 | E | 部分 | 较好 |
+| reminder-scheduler | A fire 幂等 | E restart | defer 未测 | 部分 |
+| table-projection | projection edit | E | 无 | 部分 |
+| matter-ledger | A/C | C | 去重无测 | 部分 |
+| inbound-message-gateway | — | A | — | **无** |
+| message-normalizer | 间接 | message_id | — | **弱** |
+| ledger-router | — | B 0 调用 | — | **无** |
+| tool-invoker / conflict / delayed / resume / edit-to-patch / web / versioning / attachment / memory-retriever / budget | — | 存在性否定 | — | **无** |
+| dirty-tracker | — | D 多事项漏标 | — | **不足** |
+| effect-receipt-store | boundary | C 伪造 | — | **不足** |
+
+**结论：18 tests 全绿 ≠ 35 黑箱完成。** 约 8–10 个黑箱有实质独立验证；约 10+ 个几乎无失败路径/无专测。
+
+---
+
+## 9. Scenario Trace
+
+### Scenario A（日常承诺）
+- **Expected:** Inbound→Normalizer→Turn→Context→Model→Ops→Validator→Commit→Matter/Event/People→Reminder→Dirty→Capsule→Projection→Delivery
+- **Actual:** 同上，**缺 tool-invoker**；WorkingContext 真实经过
+- **Missing/bypassed:** tool-invoker；入站无 message 幂等闸
+
+### Scenario C（多轮同一 Matter）
+- **Expected:** 同 Matter 追加 Event，不重复创建
+- **Actual:** fixture 句式 ✅；短句/近义 → intent=note、0 Matter
+- **Missing:** find_similar 未接入；NL 重复 → 双 Reminder
+
+### Scenario E（纠正）
+- **Expected:** Source 保留；旧 interpretation 失效；当前态=周四
+- **Actual:** Source 保留 ✅；当前态更新 ✅；**interp 全 ACTIVE（F-011）**；reminder 路径 field 可注入（F-002）
+
+### T0–T5
+- **Actual:** nightly fixture 独立复演通过（含 restart T5）
+- **Note:** fire 去重靠 status 过滤；defer 先 fire 再改期（F-017）
+
+---
+
+## 10. Previous Finding Reverification
+
+| ID | 结论 |
+|---|---|
+| F-001 多 op 半提交 | **REPRODUCED**（Auditor D 独立探针） |
+| F-002 Correction field SQL | **REPRODUCED**（含列污染成功） |
+| F-003 NL 双 Reminder | **REPRODUCED** |
+| F-004 P1 绕过 Commit | **REPRODUCED**（set_parent / knowledge.upsert） |
+| F-005 message_id 无幂等 | **REPRODUCED** |
+| F-006 Directive 优先级 | **REPRODUCED**（潜伏，调用点现恒 notification） |
+| F-007 测试缺失败路径 | **仍成立** |
+| F-008 运行时直写 reminder | **仍成立**（灰区） |
+| F-009 Identity 默认构造恒真 | **仍成立**（门禁本身对错误 UUID 有效） |
+| F-010 RuleBasedModel 局限 | **REPRODUCED**（Core vs Model 已区分） |
+
+---
+
+## 11. Completion Statistics
+
+### P0（35 affected modules）
+
+| Status | Count | Modules |
+|---|---|---|
+| **VERIFIED** | **5** | delivery-router, turn-orchestrator, event-ledger, task-action-bridge, table-projection |
+| **IMPLEMENTED** | **2** | incremental-reducer, capsule-store |
+| **IMPLEMENTED_PARTIAL** | **25** | interaction-layer, agent-runtime, context-engine, personal-ledger-core, state-commit-engine, source-evidence, summary-system, durable-task-runtime, projection-layer, message-normalizer, ledger-ops-proposer, matter-ledger, people-ledger, op-validator, patch-committer, correction-applier, reminder-scheduler, model-adapter, working-context-compiler, raw-source-store, change-receipt, dirty-tracker, channel-identity-mapping, provenance-chain, effect-receipt-store |
+| **STUB** | **2** | inbound-message-gateway, ledger-router |
+| **PLANNED_ONLY** | **1** | delayed-scheduled-runner |
+| **BLOCKED** | **0** | — |
+| **TOTAL** | **35** | |
+
+### P0 四维
+
+| 维度 | 判定 |
+|---|---|
+| **FUNCTIONAL CLOSURE** | **PARTIAL** — A/C/E + T0–T5 fixture 闭环成立；入站幂等、interp 失效、去重未闭合 |
+| **ARCHITECTURE CONFORMANCE** | **FAIL** — 唯一写入口不成立；multi-op 非原子；Correction 不安全 |
+| **TEST COVERAGE** | **PARTIAL** — 18 绿覆盖主路径；失败/注入/幂等/多黑箱专测不足 |
+| **FAILURE RESILIENCE** | **WEAK** — F-001 半提交；失败无 REJECTED receipt；defer 污染 fire_count |
+
+### P1（10 bound）
+
+| Status | Count |
+|---|---|
+| VERIFIED | 0 |
+| IMPLEMENTED | 0 |
+| **IMPLEMENTED_PARTIAL** | **3**（tree / archive / knowledge） |
+| STUB | 0 |
+| **PLANNED_ONLY** | **7** |
+| TOTAL | 10 |
+
+---
+
+## 12. Verdict
+
+```
+P0 VERDICT:   FAIL
+P1 VERDICT:   PARTIAL_WITH_FINDINGS
+OVERALL:      RETURN_TO_EXECUTOR
+```
+
+**理由：** fixture 全绿不能覆盖「State/Commit 唯一写入口」「多 op 原子性」「Correction 安全」「纠正失效旧解释」四条架构不变量。F-001/F-002/F-004/F-011 均独立复现，属任务书 P0 BLOCKER 定义（数据错误/半套提交/Canonical 双写/假完成）。
+
+---
+
+## 13. Required Fixes（仅阻止达当前阶段的问题）
+
+1. **F-001** — 去掉 `ledgers.py` / reminder 写路径内层 `store.commit()`；`_Txn` 改用统一 `Store.commit`；补「中途失败零残留 + 同 op_id 可安全重试」测试。
+2. **F-002** — Correction `field` 白名单（matter: due_at/due_label/next_action/status；reminder: status/due_at/title/body/next_action）；禁止 f-string 拼列名。
+3. **F-004** — 写入门禁：`Store.execute` 业务表仅允许 StateCommit 引擎（或强制 ledger API 内部不暴露）；P1 `set_parent`/`knowledge.upsert` 改走 Op。
+4. **F-011** — `correct_field` 必须携带 `interp_id`（或按 matter+kind 自动失效 ACTIVE 解释）；补「纠正后旧解释 INVALIDATED」断言。
+5. **F-003/F-005** — CREATE_REMINDER 语义/collapse 去重；message_id 重放闸。
+6. **F-013** — dirty 按本批全部 `matter_id` 标记，而非覆盖为最后一个。
+7. **F-017/F-006** — policy 先于 mark_fired；`kind=="notification" and (hour>=22 or hour<8)`。
+8. **F-014** — 接入或删除 LedgerRouter；不要留死代码充数。
+
+---
+
+**审计纪律：** 未改产品代码 / BBM canonical。探针仅 TEMP。执行方 `READY_FOR_INDEPENDENT_AUDIT` 自报与可复现架构缺陷冲突，**不能盖章进入下一阶段**。
+
+

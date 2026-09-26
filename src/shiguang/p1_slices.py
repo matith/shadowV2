@@ -1,29 +1,46 @@
 # -*- coding: utf-8 -*-
-"""P1 slice: matter tree + archive mini-capsule + knowledge ledger (minimal).
+"""P1 slice facades — all Canonical writes go through State/Commit Ops.
 
-Extends P0 without breaking its regression.
+Matter tree / archive / knowledge must not bypass the unique write path.
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .ledgers import MatterLedger
 from .storage import Store
-from .types import OpKind, new_id, now_ms
+from .types import LedgerOp, OpKind, new_id, now_ms
+
+
+class P1WriteBridge:
+    """Produces LedgerOps and commits them via StateCommitEngine."""
+
+    def __init__(self, commit_ops: Callable[[list[LedgerOp]], Any]):
+        self._commit_ops = commit_ops
+
+    def commit(self, ops: list[LedgerOp]):
+        return self._commit_ops(ops)
 
 
 class MatterTree:
-    def __init__(self, store: Store, matter: MatterLedger):
+    def __init__(self, store: Store, matter: MatterLedger, bridge: Optional[P1WriteBridge] = None):
         self.store = store
         self.matter = matter
+        self.bridge = bridge
 
-    def set_parent(self, child_id: str, parent_id: Optional[str]) -> None:
-        self.store.execute(
-            "UPDATE matters SET parent_matter_id=?, revision=revision+1, updated_at=? WHERE matter_id=?",
-            (parent_id, now_ms(), child_id),
+    def set_parent(self, child_id: str, parent_id: Optional[str]) -> dict:
+        if not self.bridge:
+            raise RuntimeError("MatterTree.set_parent requires State/Commit bridge")
+        op = LedgerOp(
+            op_id=new_id("op"),
+            kind=OpKind.SET_MATTER_PARENT.value,
+            payload={"matter_id": child_id, "parent_matter_id": parent_id},
+            matter_ref=child_id,
+            actor="p1_tree",
         )
-        self.store.commit()
+        receipt = self.bridge.commit([op])
+        return {"receipt": receipt, "matter_id": child_id, "parent_matter_id": parent_id}
 
     def children(self, matter_id: str) -> list[dict]:
         rows = self.store.query("SELECT * FROM matters WHERE parent_matter_id=?", (matter_id,))
@@ -55,31 +72,25 @@ class MatterTree:
 
 
 class ArchiveLedger:
-    """Archive keeps title/state/capsule/pointer; discoverable on recall."""
-
-    def __init__(self, store: Store, matter: MatterLedger):
+    def __init__(self, store: Store, matter: MatterLedger, bridge: Optional[P1WriteBridge] = None):
         self.store = store
         self.matter = matter
+        self.bridge = bridge
 
     def archive(self, matter_id: str, *, mini_capsule: Optional[dict] = None) -> dict:
+        if not self.bridge:
+            raise RuntimeError("ArchiveLedger.archive requires State/Commit bridge")
+        op = LedgerOp(
+            op_id=new_id("op"),
+            kind=OpKind.ARCHIVE_MATTER.value,
+            payload={"matter_id": matter_id, "mini_capsule": mini_capsule},
+            matter_ref=matter_id,
+            actor="p1_archive",
+        )
+        receipt = self.bridge.commit([op])
         m = self.matter.get(matter_id)
-        if not m:
-            raise KeyError(matter_id)
-        cap = mini_capsule or {
-            "goal": m["title"],
-            "current": m.get("next_action") or m.get("status"),
-            "open_items": [],
-        }
-        fields = dict(m.get("fields") or {})
-        fields["archive"] = {
-            "archived_at": now_ms(),
-            "title": m["title"],
-            "status": m["status"],
-            "mini_capsule": cap,
-            "pointer": f"matter:{matter_id}",
-        }
-        self.matter.update_fields(matter_id, fields, status="ARCHIVED")
-        return fields["archive"]
+        arch = (m.get("fields") or {}).get("archive") if m else None
+        return {"receipt": receipt, "archive": arch}
 
     def recall(self, keyword: str) -> list[dict]:
         rows = self.store.query("SELECT * FROM matters WHERE status='ARCHIVED'")
@@ -104,25 +115,23 @@ class ArchiveLedger:
 
 
 class KnowledgeLedger:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, bridge: Optional[P1WriteBridge] = None):
         self.store = store
+        self.bridge = bridge
 
-    def upsert(self, *, topic: str, content: str, source_id: Optional[str] = None) -> str:
-        existing = self.store.query_one("SELECT knowledge_id FROM knowledge WHERE topic=?", (topic,))
-        if existing:
-            self.store.execute(
-                "UPDATE knowledge SET content=?, source_id=? WHERE knowledge_id=?",
-                (content, source_id, existing["knowledge_id"]),
-            )
-            self.store.commit()
-            return existing["knowledge_id"]
-        kid = new_id("know")
-        self.store.execute(
-            "INSERT INTO knowledge(knowledge_id,topic,content,source_id,created_at) VALUES(?,?,?,?,?)",
-            (kid, topic, content, source_id, now_ms()),
+    def upsert(self, *, topic: str, content: str, source_id: Optional[str] = None) -> dict:
+        if not self.bridge:
+            raise RuntimeError("KnowledgeLedger.upsert requires State/Commit bridge")
+        op = LedgerOp(
+            op_id=new_id("op"),
+            kind=OpKind.UPSERT_KNOWLEDGE.value,
+            payload={"topic": topic, "content": content},
+            source_ref=source_id,
+            actor="p1_knowledge",
         )
-        self.store.commit()
-        return kid
+        receipt = self.bridge.commit([op])
+        row = self.store.query_one("SELECT knowledge_id FROM knowledge WHERE topic=?", (topic,))
+        return {"receipt": receipt, "knowledge_id": row["knowledge_id"] if row else None}
 
     def search(self, keyword: str) -> list[dict]:
         rows = self.store.query("SELECT * FROM knowledge")

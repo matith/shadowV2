@@ -31,6 +31,9 @@ class OpKind(str, Enum):
     UPSERT_KNOWLEDGE = "upsert_knowledge"
     UPSERT_DIRECTIVE = "upsert_directive"
     ARCHIVE_MATTER = "archive_matter"
+    SET_MATTER_PARENT = "set_matter_parent"
+    MARK_REMINDER_FIRED = "mark_reminder_fired"
+    MARK_REMINDER_MISSED = "mark_reminder_missed"
 
 
 class ReminderStatus(str, Enum):

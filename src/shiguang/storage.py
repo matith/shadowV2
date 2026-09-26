@@ -184,6 +184,16 @@ CREATE TABLE IF NOT EXISTS knowledge (
   source_id TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS message_inbox (
+  message_id TEXT PRIMARY KEY,
+  channel TEXT NOT NULL,
+  user_ref TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  turn_id TEXT,
+  receipt_id TEXT,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_matters_status ON matters(status);
 CREATE INDEX IF NOT EXISTS idx_events_matter ON events(matter_id);
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_at, status);
@@ -196,10 +206,22 @@ class Store:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._txn_depth = 0
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.isolation_level = None  # explicit BEGIN/COMMIT control
         self._conn.executescript(SCHEMA)
+        self._conn.execute("BEGIN")
         self._conn.commit()
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._txn_depth > 0
+
+    def require_transaction(self, what: str = "business mutation") -> None:
+        """Canonical business writes must run inside State/Commit transaction."""
+        if self._txn_depth <= 0:
+            raise RuntimeError(f"{what} must run inside a State/Commit transaction")
 
     def close(self) -> None:
         with self._lock:
@@ -211,7 +233,14 @@ class Store:
             return cur
 
     def commit(self) -> None:
+        """Durable commit. Nested/no-op while an owned transaction is open.
+
+        State/Commit Engine owns the transaction boundary. Mid-transaction
+        `commit()` must not escape and create half-committed canonical state.
+        """
         with self._lock:
+            if self._txn_depth > 0:
+                return
             self._conn.commit()
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
@@ -243,20 +272,27 @@ class Store:
 
 
 class _Txn:
+    """Single owner of durable commit/rollback for a batch of mutations."""
+
     def __init__(self, store: Store):
         self.store = store
 
     def __enter__(self):
         self.store._lock.acquire()
+        self.store._txn_depth += 1
+        if self.store._txn_depth == 1:
+            self.store._conn.execute("BEGIN")
         return self.store
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if exc_type is None:
-                self.store._conn.commit()
-            else:
-                self.store._conn.rollback()
+            if self.store._txn_depth == 1:
+                if exc_type is None:
+                    self.store._conn.commit()
+                else:
+                    self.store._conn.rollback()
         finally:
+            self.store._txn_depth -= 1
             self.store._lock.release()
         return False
 

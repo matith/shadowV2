@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""personal-ledger-core sub-blackboxes: matter / event / people."""
+"""personal-ledger-core sub-blackboxes: matter / event / people.
+
+Write discipline (dec-source-write):
+- These methods only mutate. They never call Store.commit().
+- Canonical business mutations must run inside State/Commit Engine transaction.
+"""
 from __future__ import annotations
 
 import json
@@ -27,6 +32,7 @@ class MatterLedger:
     ) -> str:
         from .types import new_id
 
+        self.store.require_transaction("MatterLedger.create")
         mid = matter_id or new_id("matter")
         now = now_ms()
         self.store.execute(
@@ -47,7 +53,6 @@ class MatterLedger:
                 now,
             ),
         )
-        self.store.commit()
         return mid
 
     def get(self, matter_id: str) -> Optional[dict]:
@@ -58,15 +63,23 @@ class MatterLedger:
         row["fields"] = json.loads(row["fields"])
         return row
 
-    def update_fields(self, matter_id: str, patch: dict, *, next_action: Optional[str] = None, due_at: Any = ..., status: Optional[str] = None) -> dict:
+    def update_fields(
+        self,
+        matter_id: str,
+        patch: dict,
+        *,
+        next_action: Optional[str] = None,
+        due_at: Any = ...,
+        status: Optional[str] = None,
+    ) -> dict:
         """Update current state fields. Returns old_to_new pairs."""
+        self.store.require_transaction("MatterLedger.update_fields")
         old = self.get(matter_id)
         if not old:
             raise KeyError(matter_id)
         changes = []
         fields = dict(old.get("fields") or {})
         patch = dict(patch or {})
-        # promote well-known top-level keys out of fields payload
         if "due_at" in patch and due_at is ...:
             due_at = patch.pop("due_at")
         if "status" in patch and status is None:
@@ -98,8 +111,22 @@ class MatterLedger:
             "UPDATE matters SET status=?, next_action=?, due_at=?, fields=?, revision=revision+1, updated_at=? WHERE matter_id=?",
             (status_val, next_action_val, due_val, json.dumps(fields, ensure_ascii=False), now_ms(), matter_id),
         )
-        self.store.commit()
         return {"matter_id": matter_id, "changes": changes, "revision": (old.get("revision") or 1) + 1}
+
+    def set_parent(self, matter_id: str, parent_matter_id: Optional[str]) -> dict:
+        self.store.require_transaction("MatterLedger.set_parent")
+        old = self.get(matter_id)
+        if not old:
+            raise KeyError(matter_id)
+        prev = old.get("parent_matter_id")
+        self.store.execute(
+            "UPDATE matters SET parent_matter_id=?, revision=revision+1, updated_at=? WHERE matter_id=?",
+            (parent_matter_id, now_ms(), matter_id),
+        )
+        return {
+            "matter_id": matter_id,
+            "changes": [{"field": "parent_matter_id", "old": prev, "new": parent_matter_id}],
+        }
 
     def find_similar(self, *, title: str, person_name: Optional[str] = None, due_at: Optional[int] = None) -> list[dict]:
         rows = self.store.query("SELECT * FROM matters WHERE status != 'ARCHIVED'")
@@ -110,7 +137,6 @@ class MatterLedger:
             rt = (r["title"] or "").lower()
             if title_l and (title_l in rt or rt in title_l):
                 score += 3
-            # token overlap
             t_tokens = set(title.replace("，", " ").replace("。", " ").split())
             r_tokens = set((r["title"] or "").replace("，", " ").replace("。", " ").split())
             score += len(t_tokens & r_tokens)
@@ -168,6 +194,7 @@ class EventLedger:
     ) -> str:
         from .types import new_id
 
+        self.store.require_transaction("EventLedger.append")
         eid = event_id or new_id("evt")
         self.store.execute(
             "INSERT INTO events(event_id,matter_id,event_type,summary,people,source_id,created_at,payload) VALUES(?,?,?,?,?,?,?,?)",
@@ -182,7 +209,6 @@ class EventLedger:
                 json.dumps(payload or {}, ensure_ascii=False),
             ),
         )
-        self.store.commit()
         return eid
 
     def list_for_matter(self, matter_id: str) -> list[dict]:
@@ -200,9 +226,12 @@ class PeopleLedger:
     def __init__(self, store: Store):
         self.store = store
 
-    def upsert(self, *, name: str, person_id: Optional[str] = None, org: str = "", role: str = "", tags: Optional[list] = None) -> str:
+    def upsert(
+        self, *, name: str, person_id: Optional[str] = None, org: str = "", role: str = "", tags: Optional[list] = None
+    ) -> str:
         from .types import new_id
 
+        self.store.require_transaction("PeopleLedger.upsert")
         existing = self.store.query_one("SELECT person_id FROM people WHERE name=?", (name,))
         pid = person_id or (existing["person_id"] if existing else new_id("person"))
         now = now_ms()
@@ -216,7 +245,6 @@ class PeopleLedger:
                 "INSERT INTO people(person_id,name,org,role,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                 (pid, name, org, role, json.dumps(tags or [], ensure_ascii=False), now, now),
             )
-        self.store.commit()
         return pid
 
     def get(self, person_id: str) -> Optional[dict]:

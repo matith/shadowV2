@@ -169,8 +169,16 @@ class EffectReceiptStore:
         self.store = store
 
     def attach(self, receipt: EffectReceipt) -> str:
+        # insert-only: never overwrite an existing receipt (anti-tamper)
+        existing = self.store.query_one(
+            "SELECT effect_id FROM effect_receipts WHERE effect_id=?", (receipt.effect_id,)
+        )
+        if existing:
+            return existing["effect_id"]
+        if receipt.result == "success" and not receipt.external_ref:
+            raise ValueError("successful effect requires external_ref")
         self.store.execute(
-            "INSERT OR REPLACE INTO effect_receipts(effect_id,capability,request_digest,target,result,external_ref,timestamp,evidence_ref,op_id,turn_id)"
+            "INSERT INTO effect_receipts(effect_id,capability,request_digest,target,result,external_ref,timestamp,evidence_ref,op_id,turn_id)"
             " VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 receipt.effect_id,

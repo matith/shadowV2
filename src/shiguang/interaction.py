@@ -30,11 +30,20 @@ class FakeInboundChannel:
 class MessageNormalizer:
     def normalize(self, raw: dict) -> MessageEnvelope:
         text = raw.get("text") or ""
+        # deterministic message identity: channel+user+text+time-bucket (input replay gate)
+        import hashlib
+
+        ts = int(raw.get("ts") or now_ms())
+        # 1-minute bucket so accidental re-push of same utterance is replayable
+        bucket = ts // 60000
+        digest = hashlib.sha256(
+            f"{raw.get('channel')}|{raw.get('user_ref')}|{text}|{bucket}".encode("utf-8")
+        ).hexdigest()[:16]
         return MessageEnvelope(
-            message_id=new_id("msg"),
+            message_id=f"msg_{digest}",
             channel=raw.get("channel") or "fake",
             user_ref=raw.get("user_ref") or "user",
-            ts_ms=int(raw.get("ts") or now_ms()),
+            ts_ms=ts,
             text=text,
             attachments=raw.get("attachments") or [],
             provenance={"channel": raw.get("channel"), "user_ref": raw.get("user_ref")},

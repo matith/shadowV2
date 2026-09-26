@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """durable-task-runtime: reminder-scheduler + delayed runner + task-action-bridge.
 
-complete/snooze go through TaskActionProposal → State/Commit, never direct Matter write.
+complete/snooze/fire go through TaskActionProposal → State/Commit.
+Directive policy is evaluated BEFORE fire mutation.
 """
 from __future__ import annotations
 
@@ -44,27 +45,26 @@ class ReminderScheduler:
             (now,),
         )
 
-    def mark_fired(self, reminder_id: str) -> dict:
-        row = self.store.query_one("SELECT * FROM reminders WHERE reminder_id=?", (reminder_id,))
-        if not row:
-            raise KeyError(reminder_id)
-        # idempotent: already FIRED for this due window → no double fire
-        if row["status"] == ReminderStatus.FIRED.value and row.get("last_fired_at") == row["due_at"]:
-            return {"reminder_id": reminder_id, "already_fired": True, "fire_count": row["fire_count"]}
-        self.store.execute(
-            "UPDATE reminders SET status=?, fire_count=fire_count+1, last_fired_at=?, updated_at=? WHERE reminder_id=?",
-            (ReminderStatus.FIRED.value, self.clock.now(), now_ms(), reminder_id),
-        )
-        self.store.commit()
-        return {
-            "reminder_id": reminder_id,
-            "already_fired": False,
-            "fire_count": row["fire_count"] + 1,
-            "matter_id": row["matter_id"],
-            "title": row["title"],
-            "body": row["body"],
-            "next_action": row["next_action"],
-        }
+    def mark_fired_ops(self, reminder_id: str) -> list[LedgerOp]:
+        """Fire is a canonical reminder mutation → produces ops for State/Commit."""
+        return [
+            LedgerOp(
+                op_id=new_id("op"),
+                kind=OpKind.MARK_REMINDER_FIRED.value,
+                payload={"reminder_id": reminder_id},
+                actor="durable",
+            )
+        ]
+
+    def mark_missed_ops(self, reminder_id: str) -> list[LedgerOp]:
+        return [
+            LedgerOp(
+                op_id=new_id("op"),
+                kind=OpKind.MARK_REMINDER_MISSED.value,
+                payload={"reminder_id": reminder_id},
+                actor="durable",
+            )
+        ]
 
     def mark_missed_catchup(self) -> list[dict]:
         now = self.clock.now()
@@ -72,19 +72,17 @@ class ReminderScheduler:
             "SELECT * FROM reminders WHERE status IN ('SCHEDULED','SNOOZED') AND due_at < ?",
             (now - 24 * 3600 * 1000,),
         )
-        out = []
-        for r in rows:
-            self.store.execute(
-                "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
-                (ReminderStatus.MISSED.value, now_ms(), r["reminder_id"]),
-            )
-            out.append(dict(r))
-        self.store.commit()
-        return out
+        return [dict(r) for r in rows]
 
 
 class DirectivePolicyEvaluator:
-    """Minimal P0 policy: deny night work reminders, allow otherwise."""
+    """Minimal P0 policy: deny/defer night work notifications only.
+
+    Precedence: DENY > DEFER > ALLOW.
+    """
+
+    NIGHT_START = 22
+    NIGHT_END = 8
 
     def __init__(self, store: Store, clock: FakeClock):
         self.store = store
@@ -92,8 +90,8 @@ class DirectivePolicyEvaluator:
 
     def evaluate_delivery(self, *, kind: str, target: str, text: str = "") -> PolicyDecision:
         hour = (self.clock.now() // 3600000) % 24
-        # night quiet hours 22:00-08:00 for work-related notifications
-        if kind == "notification" and hour >= 22 or hour < 8:
+        # parentheses required: only notifications are subject to night quiet hours
+        if kind == "notification" and (hour >= self.NIGHT_START or hour < self.NIGHT_END):
             if any(w in text for w in ("工作", "合同", "客户", "项目", "盖章", "确认")):
                 return PolicyDecision(
                     action="defer",
@@ -162,20 +160,24 @@ class TaskActionBridge:
 
 
 class DurableTaskRuntime:
-    def __init__(self, store: Store, clock: FakeClock, policy: DirectivePolicyEvaluator):
+    def __init__(
+        self,
+        store: Store,
+        clock: FakeClock,
+        policy: DirectivePolicyEvaluator,
+        commit_ops=None,
+    ):
         self.store = store
         self.clock = clock
         self.policy = policy
         self.scheduler = ReminderScheduler(store, clock)
         self.bridge = TaskActionBridge(store)
+        # injectable StateCommitEngine.commit_ops for canonical mutations
+        self._commit_ops = commit_ops
 
     def run_due(self, deliver_fn: Optional[Callable[[dict], dict]] = None) -> list[dict]:
         results = []
         for rem in self.scheduler.due_reminders():
-            fired = self.scheduler.mark_fired(rem["reminder_id"])
-            if fired.get("already_fired"):
-                results.append({"reminder_id": rem["reminder_id"], "status": "ALREADY_FIRED"})
-                continue
             payload = {
                 "kind": "notification",
                 "reminder_id": rem["reminder_id"],
@@ -186,19 +188,43 @@ class DurableTaskRuntime:
                 "collapse_key": rem.get("collapse_key"),
                 "text": f"提醒：{rem['title']}｜{rem.get('next_action') or rem['body']}",
             }
+            # policy BEFORE any fire mutation
             decision = self.policy.evaluate_delivery(
                 kind="notification", target=rem.get("collapse_key") or "", text=payload["text"]
             )
             if decision.action != "allow":
-                # defer: push due_at to next morning 09:00, keep task alive
                 next_morning = ((self.clock.now() // 86400000) + 1) * 86400000 + 9 * 3600000
-                self.store.execute(
-                    "UPDATE reminders SET status=?, due_at=?, updated_at=? WHERE reminder_id=?",
-                    (ReminderStatus.SNOOZED.value, next_morning, now_ms(), rem["reminder_id"]),
+                if self._commit_ops:
+                    self._commit_ops(
+                        [
+                            LedgerOp(
+                                op_id=new_id("op"),
+                                kind=OpKind.SNOOZE_REMINDER.value,
+                                payload={"reminder_id": rem["reminder_id"], "due_at": int(next_morning)},
+                                matter_ref=rem["matter_id"],
+                                actor="durable_defer",
+                            )
+                        ]
+                    )
+                results.append(
+                    {"reminder_id": rem["reminder_id"], "status": "DEFERRED", "reason": decision.reason}
                 )
-                self.store.commit()
-                results.append({"reminder_id": rem["reminder_id"], "status": "DEFERRED", "reason": decision.reason})
                 continue
+
+            # already fired once? skip (idempotent)
+            if rem["status"] == ReminderStatus.FIRED.value and rem.get("last_fired_at"):
+                results.append({"reminder_id": rem["reminder_id"], "status": "ALREADY_FIRED"})
+                continue
+
+            if self._commit_ops:
+                self._commit_ops(self.scheduler.mark_fired_ops(rem["reminder_id"]))
             delivery = deliver_fn(payload) if deliver_fn else {"delivered": True, "payload": payload}
-            results.append({"reminder_id": rem["reminder_id"], "status": "FIRED", "delivery": delivery, "payload": payload})
+            results.append(
+                {
+                    "reminder_id": rem["reminder_id"],
+                    "status": "FIRED",
+                    "delivery": delivery,
+                    "payload": payload,
+                }
+            )
         return results
