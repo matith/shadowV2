@@ -6,6 +6,7 @@ Matter tree / archive / knowledge must not bypass the unique write path.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .ledgers import MatterLedger
@@ -412,3 +413,123 @@ class MemoryTier:
         """COLD is demoted, never deleted. Long-term stays HOT/WARM-reachable."""
         row = self.store.query_one("SELECT * FROM matters WHERE matter_id=?", (matter_id,))
         return row is not None
+
+
+# Canonical tables that must survive backup/restore. Derived can be rebuilt.
+CANONICAL_TABLES = (
+    "raw_sources",
+    "interpretations",
+    "people",
+    "matters",
+    "events",
+    "reminders",
+    "corrections",
+    "knowledge",
+    "files",
+    "op_log",
+    "commits",
+    "change_receipts",
+    "effect_receipts",
+    "deliveries",
+    "channel_identities",
+    "directives",
+    "message_inbox",
+)
+DERIVED_TABLES = ("capsules", "dirty_nodes")
+
+
+class BackupRestore:
+    """Canonical + Source backup. Derived is rebuildable."""
+
+    def __init__(self, store: Store):
+        self.store = store
+
+    def export_backup(self, dest_dir: str | Path) -> dict:
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        manifest = {"canonical": {}, "derived": {}, "tables": list(CANONICAL_TABLES)}
+        for table in CANONICAL_TABLES:
+            rows = self.store.query(f"SELECT * FROM {table}")
+            (dest / f"{table}.json").write_text(
+                json.dumps(rows, ensure_ascii=False, default=str), encoding="utf-8"
+            )
+            manifest["canonical"][table] = len(rows)
+        for table in DERIVED_TABLES:
+            rows = self.store.query(f"SELECT * FROM {table}")
+            (dest / f"{table}.json").write_text(
+                json.dumps(rows, ensure_ascii=False, default=str), encoding="utf-8"
+            )
+            manifest["derived"][table] = len(rows)
+        (dest / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return manifest
+
+    def precheck(self, dest_dir: str | Path) -> dict:
+        """恢复预检：缺表/坏 JSON 先报，不半恢复。"""
+        dest = Path(dest_dir)
+        missing = []
+        unreadable = []
+        counts = {}
+        if not dest.exists():
+            return {"ok": False, "missing": list(CANONICAL_TABLES), "unreadable": [], "counts": {}}
+        for table in CANONICAL_TABLES:
+            path = dest / f"{table}.json"
+            if not path.exists():
+                missing.append(table)
+                continue
+            try:
+                rows = json.loads(path.read_text(encoding="utf-8"))
+                counts[table] = len(rows)
+            except Exception:
+                unreadable.append(table)
+        return {
+            "ok": not missing and not unreadable,
+            "missing": missing,
+            "unreadable": unreadable,
+            "counts": counts,
+        }
+
+    def restore_backup(self, dest_dir: str | Path, *, rebuild_derived: bool = True) -> dict:
+        dest = Path(dest_dir)
+        check = self.precheck(dest)
+        if not check["ok"]:
+            raise RuntimeError(f"backup precheck failed: {check}")
+        restored = {}
+        with self.store.transaction():
+            for table in CANONICAL_TABLES:
+                rows = json.loads((dest / f"{table}.json").read_text(encoding="utf-8"))
+                self.store.execute(f"DELETE FROM {table}")
+                if rows:
+                    cols = list(rows[0].keys())
+                    placeholders = ",".join("?" * len(cols))
+                    col_sql = ",".join(cols)
+                    for row in rows:
+                        self.store.execute(
+                            f"INSERT INTO {table}({col_sql}) VALUES({placeholders})",
+                            tuple(row.get(c) for c in cols),
+                        )
+                restored[table] = len(rows)
+            # drop derived; optional rebuild happens after txn
+            for table in DERIVED_TABLES:
+                self.store.execute(f"DELETE FROM {table}")
+        rebuilt = []
+        if rebuild_derived:
+            rebuilt = self.rebuild_derived()
+        return {"restored": restored, "rebuilt": rebuilt, "precheck": check}
+
+    def rebuild_derived(self) -> list[str]:
+        """Canonical is truth. Derived loss is recoverable."""
+        from .summary_system import SummarySystem
+        from .ledgers import EventLedger, MatterLedger
+
+        matter = MatterLedger(self.store)
+        event = EventLedger(self.store)
+        summary = SummarySystem(self.store, matter, event)
+        done = []
+        rows = self.store.query("SELECT matter_id FROM matters")
+        for r in rows:
+            mid = r["matter_id"]
+            summary.dirty.mark(mid, "matter")
+        done = summary.process_dirty()
+        return done
