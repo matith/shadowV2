@@ -268,3 +268,147 @@ class FileLedger:
         """Return source_id if linked — never bytes, never a source text copy."""
         row = self.get(file_id)
         return row.get("source_id") if row else None
+
+
+class ProductLedger:
+    """产品/政策/资费/参数资料语义目录. Facts + source refs, not source dumps."""
+
+    def __init__(self, store: Store, bridge: Optional[P1WriteBridge] = None):
+        self.store = store
+        self.bridge = bridge
+
+    def upsert(
+        self,
+        *,
+        product_id: str,
+        name: str,
+        kind: str = "product",
+        summary: str = "",
+        params: Optional[dict] = None,
+        source_id: Optional[str] = None,
+    ) -> dict:
+        if not self.bridge:
+            raise RuntimeError("ProductLedger.upsert requires State/Commit bridge")
+        # reuse knowledge write path: topic=product_id, content=semantic summary
+        payload = {
+            "topic": f"product:{product_id}",
+            "content": json.dumps(
+                {
+                    "product_id": product_id,
+                    "name": name,
+                    "kind": kind,
+                    "summary": summary,
+                    "params": params or {},
+                },
+                ensure_ascii=False,
+            ),
+        }
+        op = LedgerOp(
+            op_id=new_id("op"),
+            kind=OpKind.UPSERT_KNOWLEDGE.value,
+            payload=payload,
+            source_ref=source_id,
+            actor="p1_product",
+        )
+        receipt = self.bridge.commit([op])
+        row = self.store.query_one(
+            "SELECT knowledge_id FROM knowledge WHERE topic=?", (f"product:{product_id}",)
+        )
+        return {"receipt": receipt, "knowledge_id": row["knowledge_id"] if row else None}
+
+    def get(self, product_id: str) -> Optional[dict]:
+        row = self.store.query_one(
+            "SELECT * FROM knowledge WHERE topic=?", (f"product:{product_id}",)
+        )
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["meta"] = json.loads(row["content"])
+        except Exception:
+            out["meta"] = {}
+        return out
+
+    def list(self) -> list[dict]:
+        rows = self.store.query("SELECT * FROM knowledge WHERE topic LIKE 'product:%'")
+        out = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["meta"] = json.loads(r["content"])
+            except Exception:
+                item["meta"] = {}
+            out.append(item)
+        return out
+
+    def search(self, keyword: str) -> list[dict]:
+        return [
+            x
+            for x in self.list()
+            if keyword in (x.get("topic") or "")
+            or keyword in (x.get("content") or "")
+            or keyword in json.dumps(x.get("meta") or {}, ensure_ascii=False)
+        ]
+
+
+class MemoryTier:
+    """HOT/WARM/COLD/RAW. Important long-term matters must not vanish with age."""
+
+    HOT_DAYS = 7
+    WARM_DAYS = 30
+
+    def __init__(self, store: Store, clock=None):
+        self.store = store
+        self.clock = clock
+
+    def _now(self) -> int:
+        if self.clock is not None and hasattr(self.clock, "now"):
+            return int(self.clock.now())
+        return now_ms()
+
+    def tier_of(self, matter_id: str) -> str:
+        row = self.store.query_one("SELECT * FROM matters WHERE matter_id=?", (matter_id,))
+        if not row:
+            return "RAW"
+        return self._tier_for_row(dict(row))
+
+    def _tier_for_row(self, m: dict) -> str:
+        status = m.get("status") or ""
+        fields = m.get("fields") or {}
+        if isinstance(fields, str):
+            try:
+                fields = json.loads(fields)
+            except Exception:
+                fields = {}
+        # long-term importance beats pure recency
+        if fields.get("long_term") or fields.get("pin") or fields.get("importance") == "high":
+            return "HOT"
+        if status == "ARCHIVED":
+            return "COLD"
+        age_days = (self._now() - int(m.get("updated_at") or m.get("created_at") or 0)) / 86_400_000
+        if age_days <= self.HOT_DAYS:
+            return "HOT"
+        if age_days <= self.WARM_DAYS:
+            return "WARM"
+        return "COLD"
+
+    def classify_all(self) -> list[dict]:
+        rows = self.store.query("SELECT * FROM matters")
+        out = []
+        for r in rows:
+            m = dict(r)
+            out.append(
+                {
+                    "matter_id": m["matter_id"],
+                    "title": m["title"],
+                    "status": m["status"],
+                    "tier": self._tier_for_row(m),
+                    "updated_at": m.get("updated_at"),
+                }
+            )
+        return out
+
+    def ensure_visible(self, matter_id: str) -> bool:
+        """COLD is demoted, never deleted. Long-term stays HOT/WARM-reachable."""
+        row = self.store.query_one("SELECT * FROM matters WHERE matter_id=?", (matter_id,))
+        return row is not None
