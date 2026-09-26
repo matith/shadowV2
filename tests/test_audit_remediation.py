@@ -158,6 +158,28 @@ class TestIdempotency(unittest.TestCase):
         n = self.app.store.query("SELECT COUNT(*) c FROM reminders WHERE title='X'")[0]["c"]
         self.assertEqual(n, 1)
 
+    def test_F003_completed_not_reused_new_due(self):
+        """COMPLETED reminder must not swallow a new commitment with same title."""
+        mid = "matter_x"
+        self.app.commit.commit_ops(
+            [LedgerOp(op_id="cm", kind=OpKind.CREATE_MATTER.value, payload={"title": "T", "matter_id": mid, "force_new": True})]
+        )
+        self.app.commit.commit_ops(
+            [LedgerOp(op_id="r1", kind=OpKind.CREATE_REMINDER.value, payload={"matter_id": mid, "title": "X", "due_at": 100})]
+        )
+        rid = self.app.store.query_one("SELECT reminder_id FROM reminders WHERE title='X'")["reminder_id"]
+        self.app.commit.commit_ops(
+            [LedgerOp(op_id="done", kind=OpKind.COMPLETE_REMINDER.value, payload={"reminder_id": rid})]
+        )
+        self.app.commit.commit_ops(
+            [LedgerOp(op_id="r2", kind=OpKind.CREATE_REMINDER.value, payload={"matter_id": mid, "title": "X", "due_at": 200})]
+        )
+        rows = self.app.store.query("SELECT due_at,status FROM reminders WHERE title='X' ORDER BY due_at")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["status"], "COMPLETED")
+        self.assertEqual(rows[1]["due_at"], 200)
+        self.assertEqual(rows[1]["status"], "SCHEDULED")
+
     def test_same_op_replay(self):
         op = LedgerOp(op_id="fixed", kind=OpKind.CREATE_MATTER.value, payload={"title": "A", "matter_id": "ma"})
         r1 = self.app.commit.commit_ops([op])
@@ -221,6 +243,26 @@ class TestDirectiveAndFire(unittest.TestCase):
         self.assertEqual(len([x for x in r1 if x.get("status") == "FIRED"]), 1)
         r2 = app2.run_due_tasks()
         self.assertEqual(len([x for x in r2 if x.get("status") == "FIRED"]), 0)
+
+    def test_N002_delivery_fail_is_recoverable(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        app = ShiGuangApp.open(ROOT, Path(tmp.name) / "n2.sqlite", clock=FakeClock(1_758_806_400_000))
+        self.addCleanup(app.close)
+        app.ingest_text("明天下午提醒我联系李经理，合同还没盖章。")
+        rem = app.store.query_one("SELECT * FROM reminders")
+        app.clock.set(rem["due_at"] + 1000)
+        app.delivery_adapter.fail_next = True
+        results = app.run_due_tasks()
+        self.assertTrue(any(r.get("status") == "DELIVERY_FAILED" for r in results))
+        # must NOT be stuck at FIRED
+        row = app.store.query_one("SELECT status FROM reminders WHERE reminder_id=?", (rem["reminder_id"],))
+        self.assertNotEqual(row["status"], "FIRED")
+        # retry succeeds
+        results2 = app.run_due_tasks()
+        self.assertEqual(len([x for x in results2 if x.get("status") == "FIRED"]), 1)
+        notifs = [s for s in app.delivery_adapter.sent if s["kind"] == "notification"]
+        self.assertEqual(len(notifs), 1)
 
 
 class TestDirtyMultiMatter(unittest.TestCase):

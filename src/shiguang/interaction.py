@@ -123,7 +123,13 @@ class DeliveryRouter:
                 (collapse_key, reminder_ref),
             )
             if prior:
-                return {"delivered": False, "reason": "COLLAPSED", "delivery_id": prior["delivery_id"]}
+                # already delivered earlier — count as success for fire/receipt purposes
+                return {
+                    "delivered": True,
+                    "reason": "COLLAPSED",
+                    "delivery_id": prior["delivery_id"],
+                    "status": "SENT",
+                }
 
         payload = DeliveryPayload(
             delivery_id=new_id("del"),

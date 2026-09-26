@@ -40,6 +40,9 @@ class ReminderScheduler:
 
     def due_reminders(self) -> list[dict]:
         now = self.clock.now()
+        # FIRED is included only as "triggered but maybe not delivered" is
+        # handled by not marking FIRED until delivery succeeds. Scan is
+        # SCHEDULED/SNOOZED/MISSED so failed deliveries stay recoverable.
         return self.store.query(
             "SELECT * FROM reminders WHERE status IN ('SCHEDULED','SNOOZED','MISSED') AND due_at <= ? ORDER BY due_at",
             (now,),
@@ -211,14 +214,23 @@ class DurableTaskRuntime:
                 )
                 continue
 
-            # already fired once? skip (idempotent)
-            if rem["status"] == ReminderStatus.FIRED.value and rem.get("last_fired_at"):
-                results.append({"reminder_id": rem["reminder_id"], "status": "ALREADY_FIRED"})
+            # deliver first; mark FIRED only after a durable delivery outcome
+            # (collapse dedups retries). Failure leaves the reminder recoverable.
+            delivery = deliver_fn(payload) if deliver_fn else {"delivered": True, "payload": payload}
+            if not delivery.get("delivered"):
+                # do NOT stick at FIRED — keep scannable for 补送
+                results.append(
+                    {
+                        "reminder_id": rem["reminder_id"],
+                        "status": "DELIVERY_FAILED",
+                        "delivery": delivery,
+                        "payload": payload,
+                    }
+                )
                 continue
 
             if self._commit_ops:
                 self._commit_ops(self.scheduler.mark_fired_ops(rem["reminder_id"]))
-            delivery = deliver_fn(payload) if deliver_fn else {"delivered": True, "payload": payload}
             results.append(
                 {
                     "reminder_id": rem["reminder_id"],

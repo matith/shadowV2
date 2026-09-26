@@ -128,14 +128,32 @@ class ShiGuangApp:
         turn.meta["ledger_route"] = route
         ops = self._resolve_ops(turn.ops, turn)
 
-        receipt = self.commit.commit_ops(ops) if ops else ChangeReceipt(
-            receipt_id="none",
-            commit_id="none",
-            op_ids=[],
-            status="COMMITTED",
-            summary="无账本变更",
-            old_to_new=[],
+        # inbox row is part of the same durable boundary as the ops batch
+        # (close crash window that would double-write Events on same message_id)
+        inbox_sql = (
+            "INSERT INTO message_inbox(message_id,channel,user_ref,text_hash,turn_id,receipt_id,status,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?)"
         )
+
+        def _write_inbox(store, receipt_id: str):
+            store.execute(
+                inbox_sql,
+                (env.message_id, channel, user_ref, source_id, turn.turn_id, receipt_id, "PROCESSED", now_ms()),
+            )
+
+        if ops:
+            receipt = self.commit.commit_ops(ops, on_success=_write_inbox)
+        else:
+            with self.store.transaction():
+                _write_inbox(self.store, "none")
+            receipt = ChangeReceipt(
+                receipt_id="none",
+                commit_id="none",
+                op_ids=[],
+                status="COMMITTED",
+                summary="无账本变更",
+                old_to_new=[],
+            )
 
         # interpretation record (source-linked)
         interp_id = None
@@ -163,20 +181,6 @@ class ShiGuangApp:
             channel=channel,
             matter_ref=receipt.matter_ref,
         )
-        self.store.execute(
-            "INSERT INTO message_inbox(message_id,channel,user_ref,text_hash,turn_id,receipt_id,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                env.message_id,
-                channel,
-                user_ref,
-                source_id,
-                turn.turn_id,
-                receipt.receipt_id,
-                "PROCESSED",
-                now_ms(),
-            ),
-        )
-        self.store.commit()
         return {
             "turn_id": turn.turn_id,
             "source_id": source_id,

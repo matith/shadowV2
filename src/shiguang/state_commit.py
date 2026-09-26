@@ -393,22 +393,22 @@ class PatchCommitter:
         return {"changes": changes, "matter_id": matter_id}
 
     def _create_or_reuse_reminder(self, p: dict) -> tuple[str, bool]:
-        """Reminder identity = (matter_id, title, due_at) or collapse_key."""
-        collapse = p.get("collapse_key") or f"{p['matter_id']}:{p['title']}"
+        """Reminder identity = (matter_id, title, due_at) among *active* rows.
+
+        Delivery collapse_key is NOT create-identity: completed/cancelled
+        reminders must not swallow a new commitment with the same title.
+        """
+        active = ("SCHEDULED", "SNOOZED", "MISSED", "FIRED")
+        placeholders = ",".join("?" * len(active))
         existing = self.store.query_one(
-            "SELECT reminder_id FROM reminders WHERE matter_id=? AND title=? AND due_at=? AND status != 'CANCELLED'",
-            (p["matter_id"], p["title"], p["due_at"]),
+            f"SELECT reminder_id FROM reminders WHERE matter_id=? AND title=? AND due_at=? AND status IN ({placeholders})",
+            (p["matter_id"], p["title"], p["due_at"], *active),
         )
         if existing:
             return existing["reminder_id"], False
-        existing2 = self.store.query_one(
-            "SELECT reminder_id FROM reminders WHERE collapse_key=? AND status != 'CANCELLED'",
-            (collapse,),
-        )
-        if existing2:
-            return existing2["reminder_id"], False
         rid = new_id("rem")
         now = now_ms()
+        collapse = p.get("collapse_key") or f"{p['matter_id']}:{p['title']}:{p['due_at']}"
         self.store.execute(
             "INSERT INTO reminders(reminder_id,matter_id,title,body,due_at,status,fire_count,last_fired_at,collapse_key,next_action,created_at,updated_at)"
             " VALUES(?,?,?,?,?,?,0,NULL,?,?,?,?)",
@@ -459,7 +459,14 @@ class StateCommitEngine:
     def is_duplicate(self, op_id: str) -> Optional[dict]:
         return self.store.query_one("SELECT * FROM op_log WHERE op_id=?", (op_id,))
 
-    def commit_ops(self, ops: list[LedgerOp], *, require_confirm: bool = False) -> ChangeReceipt:
+    def commit_ops(
+        self,
+        ops: list[LedgerOp],
+        *,
+        require_confirm: bool = False,
+        on_success=None,
+    ) -> ChangeReceipt:
+        """Apply ops atomically. on_success(store, receipt_id) is same-txn companion write."""
         if require_confirm and any(o.risk == "high" for o in ops):
             raise CommitError("HIGH_RISK_CONFIRM_REQUIRED")
 
@@ -470,7 +477,19 @@ class StateCommitEngine:
         pending: list[LedgerOp] = []
 
         for op in ops:
-            self.validator.validate(op)
+            try:
+                self.validator.validate(op)
+            except ValidationReject as e:
+                receipt = ChangeReceipt(
+                    receipt_id=new_id("rcpt"),
+                    commit_id="none",
+                    op_ids=[op.op_id],
+                    status="REJECTED",
+                    summary=f"校验失败：{e.reason}",
+                    old_to_new=[],
+                )
+                self.receipts.emit(receipt)
+                raise
             if self.is_duplicate(op.op_id):
                 duplicates.append(op.op_id)
                 continue
@@ -489,6 +508,7 @@ class StateCommitEngine:
             return receipt
 
         commit_id = new_id("commit")
+        receipt_id = new_id("rcpt")
         try:
             with self.store.transaction():
                 for op in pending:
@@ -515,8 +535,10 @@ class StateCommitEngine:
                     applied.append(op.op_id)
                 self.store.execute(
                     "INSERT INTO commits(commit_id,op_ids,receipt_id,created_at) VALUES(?,?,?,?)",
-                    (commit_id, json.dumps(applied), None, now_ms()),
+                    (commit_id, json.dumps(applied), receipt_id, now_ms()),
                 )
+                if on_success is not None:
+                    on_success(self.store, receipt_id)
         except Exception as e:
             # full rollback owned by transaction; emit durable REJECTED receipt
             receipt = ChangeReceipt(
@@ -541,7 +563,7 @@ class StateCommitEngine:
 
         summary = self._summarize(all_changes, duplicates)
         receipt = ChangeReceipt(
-            receipt_id=new_id("rcpt"),
+            receipt_id=receipt_id,
             commit_id=commit_id,
             op_ids=applied + duplicates,
             status="COMMITTED",
