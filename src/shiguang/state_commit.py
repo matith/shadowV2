@@ -433,14 +433,34 @@ class PatchCommitter:
             matter_id = row["matter_id"]
         elif kind == OpKind.ATTACH_FILE.value:
             fid = new_id("file")
+            # File Ledger holds semantics + links only; bytes/hash stay in Source & Evidence
+            self.store.execute(
+                "INSERT INTO files(file_id,matter_id,filename,file_type,product_ref,source_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    fid,
+                    p["matter_id"],
+                    p["filename"],
+                    p.get("file_type") or "",
+                    p.get("product_ref"),
+                    op.source_ref,
+                    now_ms(),
+                ),
+            )
             fields = {}
             m = self.matter.get(p["matter_id"])
             if m:
                 fields = m.get("fields", {})
             files = list(fields.get("files") or [])
-            files.append({"file_id": fid, "filename": p["filename"], "source_id": op.source_ref})
+            files.append(
+                {
+                    "file_id": fid,
+                    "filename": p["filename"],
+                    "source_id": op.source_ref,
+                    "product_ref": p.get("product_ref"),
+                }
+            )
             self.matter.update_fields(p["matter_id"], {"files": files})
-            changes.append({"field": "file_id", "old": None, "new": fid})
+            changes.append({"field": "file_id", "old": None, "new": fid, "source_id": op.source_ref})
             matter_id = p["matter_id"]
         else:
             raise ValidationReject(f"unhandled op kind {kind}", op.op_id)

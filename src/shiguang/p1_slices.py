@@ -165,6 +165,8 @@ class ArchiveLedger:
 
 
 class KnowledgeLedger:
+    """Stable knowledge. Content is the fact; Source stays in Source & Evidence by ref."""
+
     def __init__(self, store: Store, bridge: Optional[P1WriteBridge] = None):
         self.store = store
         self.bridge = bridge
@@ -183,6 +185,86 @@ class KnowledgeLedger:
         row = self.store.query_one("SELECT knowledge_id FROM knowledge WHERE topic=?", (topic,))
         return {"receipt": receipt, "knowledge_id": row["knowledge_id"] if row else None}
 
+    def get(self, *, topic: Optional[str] = None, knowledge_id: Optional[str] = None) -> Optional[dict]:
+        if knowledge_id:
+            row = self.store.query_one("SELECT * FROM knowledge WHERE knowledge_id=?", (knowledge_id,))
+        elif topic:
+            row = self.store.query_one("SELECT * FROM knowledge WHERE topic=?", (topic,))
+        else:
+            return None
+        return dict(row) if row else None
+
+    def list(self) -> list[dict]:
+        return [dict(r) for r in self.store.query("SELECT * FROM knowledge ORDER BY created_at")]
+
     def search(self, keyword: str) -> list[dict]:
         rows = self.store.query("SELECT * FROM knowledge")
         return [dict(r) for r in rows if keyword in (r["topic"] + r["content"])]
+
+    def source_pointer(self, knowledge_id: str) -> Optional[str]:
+        """Return source_id if linked — never a copy of source text."""
+        row = self.get(knowledge_id=knowledge_id)
+        return row.get("source_id") if row else None
+
+
+class FileLedger:
+    """File semantics + links (matter / product). Bytes & hash live in Source & Evidence."""
+
+    def __init__(self, store: Store, bridge: Optional[P1WriteBridge] = None):
+        self.store = store
+        self.bridge = bridge
+
+    def attach(
+        self,
+        *,
+        matter_id: str,
+        filename: str,
+        source_id: Optional[str] = None,
+        file_type: str = "",
+        product_ref: Optional[str] = None,
+    ) -> dict:
+        if not self.bridge:
+            raise RuntimeError("FileLedger.attach requires State/Commit bridge")
+        op = LedgerOp(
+            op_id=new_id("op"),
+            kind=OpKind.ATTACH_FILE.value,
+            payload={
+                "matter_id": matter_id,
+                "filename": filename,
+                "file_type": file_type,
+                "product_ref": product_ref,
+            },
+            source_ref=source_id,
+            actor="p1_file",
+        )
+        receipt = self.bridge.commit([op])
+        row = self.store.query_one(
+            "SELECT file_id FROM files WHERE matter_id=? AND filename=? ORDER BY created_at DESC LIMIT 1",
+            (matter_id, filename),
+        )
+        return {
+            "receipt": receipt,
+            "file_id": row["file_id"] if row else None,
+            "source_id": source_id,
+        }
+
+    def list_for_matter(self, matter_id: str) -> list[dict]:
+        rows = self.store.query(
+            "SELECT * FROM files WHERE matter_id=? ORDER BY created_at", (matter_id,)
+        )
+        return [dict(r) for r in rows]
+
+    def list_for_product(self, product_ref: str) -> list[dict]:
+        rows = self.store.query(
+            "SELECT * FROM files WHERE product_ref=? ORDER BY created_at", (product_ref,)
+        )
+        return [dict(r) for r in rows]
+
+    def get(self, file_id: str) -> Optional[dict]:
+        row = self.store.query_one("SELECT * FROM files WHERE file_id=?", (file_id,))
+        return dict(row) if row else None
+
+    def source_pointer(self, file_id: str) -> Optional[str]:
+        """Return source_id if linked — never bytes, never a source text copy."""
+        row = self.get(file_id)
+        return row.get("source_id") if row else None

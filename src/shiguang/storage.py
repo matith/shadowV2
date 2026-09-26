@@ -184,6 +184,15 @@ CREATE TABLE IF NOT EXISTS knowledge (
   source_id TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS files (
+  file_id TEXT PRIMARY KEY,
+  matter_id TEXT,
+  filename TEXT NOT NULL,
+  file_type TEXT,
+  product_ref TEXT,
+  source_id TEXT,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS message_inbox (
   message_id TEXT PRIMARY KEY,
   channel TEXT NOT NULL,
