@@ -355,6 +355,64 @@ class TestCorrectionReminderReschedule(unittest.TestCase):
         ):
             self.assertNotEqual(row["due_at"], old_deadline_due)
 
+    def test_ingest_main_chain_no_double_active(self):
+        """Audit gap: production ingest, NOT pre-seeded collapse_key.
+
+        msg1 creates one commitment; correction must not leave a second
+        active reminder / second notification for the same commitment.
+        """
+        app = _open(self._tmp.name)
+        self.addCleanup(app.close)
+        t0 = app.ingest_text("明天下午提醒我联系李经理，合同还没盖章。")
+        mid = t0["receipt"].matter_ref
+        self.assertEqual(len(self._active_reminders(app, mid)), 1)
+
+        t2 = app.ingest_text("刚才说错了，不是周三，是周四。")
+        self.assertEqual(t2["intent"], "correction")
+
+        actives = self._active_reminders(app, mid)
+        self.assertEqual(
+            len(actives),
+            1,
+            f"correction ingest must leave one active reminder, got {actives}",
+        )
+        new_due = int(actives[0]["due_at"])
+        # corrected due fires exactly once; total notifications stay 1
+        app.clock.set(new_due + 1_000)
+        fired_new = [x for x in app.run_due_tasks() if x.get("status") == "FIRED"]
+        self.assertEqual(len(fired_new), 1, f"expected single fire, got {fired_new}")
+
+        notifications = [s for s in app.delivery_adapter.sent if s["kind"] == "notification"]
+        self.assertEqual(len(notifications), 1, f"double notification: {notifications}")
+
+    def test_ingest_main_chain_with_supplement_keeps_distinct_commitments(self):
+        """Supplement adds a real second commitment; only the deadline moves."""
+        app = _open(self._tmp.name)
+        self.addCleanup(app.close)
+        t0 = app.ingest_text("明天下午提醒我联系李经理，合同还没盖章。")
+        mid = t0["receipt"].matter_ref
+        app.ingest_text("补充一下，是周三之前要确认。")
+        before = self._active_reminders(app, mid)
+        self.assertEqual(len(before), 2)
+
+        app.ingest_text("刚才说错了，不是周三，是周四。")
+        actives = self._active_reminders(app, mid)
+        # contact reminder stays; deadline is moved, not duplicated
+        self.assertEqual(len(actives), 2, actives)
+        deadline = [r for r in actives if (r.get("collapse_key") or "").endswith(":deadline")]
+        self.assertEqual(len(deadline), 1, deadline)
+        contact = [r for r in actives if not (r.get("collapse_key") or "").endswith(":deadline")]
+        self.assertEqual(len(contact), 1)
+        self.assertNotEqual(deadline[0]["due_at"], contact[0]["due_at"])
+
+        # total notifications after both dues = 2 (two real commitments), never 3
+        app.clock.set(int(actives[0]["due_at"]) + 1_000)
+        app.run_due_tasks()
+        app.clock.set(int(actives[1]["due_at"]) + 1_000)
+        app.run_due_tasks()
+        notifications = [s for s in app.delivery_adapter.sent if s["kind"] == "notification"]
+        self.assertEqual(len(notifications), 2, notifications)
+
 
 if __name__ == "__main__":
     unittest.main()

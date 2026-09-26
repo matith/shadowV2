@@ -209,6 +209,8 @@ class CorrectionApplier:
 
         Link rule: same matter + due_at == old semantic time. Only SCHEDULED /
         SNOOZED / MISSED rows move — FIRED/COMPLETED/CANCELLED stay as history.
+        Unify collapse_key to the matter deadline slot so a later CREATE_REMINDER
+        in the same correction batch merges instead of double-booking.
         """
         try:
             old_due_i = int(old_due) if old_due is not None else None
@@ -229,20 +231,40 @@ class CorrectionApplier:
             (matter_id, old_due_i, *active),
         )
         out: list[dict] = []
+        deadline_key = f"{matter_id}:deadline"
+        keeper: Optional[str] = None
         for r in rows:
-            self.store.execute(
-                "UPDATE reminders SET due_at=?, updated_at=? WHERE reminder_id=?",
-                (new_due_i, now_ms(), r["reminder_id"]),
-            )
-            out.append(
-                {
-                    "field": "reminder.due_at",
-                    "old": r["due_at"],
-                    "new": new_due_i,
-                    "reminder_id": r["reminder_id"],
-                    "reason": "correction_reschedule",
-                }
-            )
+            rid = r["reminder_id"]
+            if keeper is None:
+                keeper = rid
+                self.store.execute(
+                    "UPDATE reminders SET due_at=?, collapse_key=?, updated_at=? WHERE reminder_id=?",
+                    (new_due_i, deadline_key, now_ms(), rid),
+                )
+                out.append(
+                    {
+                        "field": "reminder.due_at",
+                        "old": r["due_at"],
+                        "new": new_due_i,
+                        "reminder_id": rid,
+                        "reason": "correction_reschedule",
+                    }
+                )
+            else:
+                # same corrected time must not leave a second active row
+                self.store.execute(
+                    "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
+                    (ReminderStatus.CANCELLED.value, now_ms(), rid),
+                )
+                out.append(
+                    {
+                        "field": "reminder.status",
+                        "old": r.get("status") or ReminderStatus.SCHEDULED.value,
+                        "new": ReminderStatus.CANCELLED.value,
+                        "reminder_id": rid,
+                        "reason": "correction_merge_duplicate",
+                    }
+                )
         return out
 
     def _invalidate_active_interps(self, target_kind: str, target_id: str) -> list[str]:
@@ -474,6 +496,8 @@ class PatchCommitter:
         reminders must not swallow a new commitment with the same title.
         An explicit collapse_key on an *active* row is a semantic link —
         correction/replace reschedules that row instead of double-booking.
+        Deadline-slot creates also merge onto an active row already sitting
+        at the same matter+due (correction reschedule then CREATE must not double).
         """
         active = ("SCHEDULED", "SNOOZED", "MISSED", "FIRED")
         placeholders = ",".join("?" * len(active))
@@ -492,18 +516,55 @@ class PatchCommitter:
         )
         if linked:
             self.store.execute(
-                "UPDATE reminders SET title=?, body=?, due_at=?, next_action=?, status=?, updated_at=? WHERE reminder_id=?",
+                "UPDATE reminders SET title=?, body=?, due_at=?, next_action=?, status=?, collapse_key=?, updated_at=? WHERE reminder_id=?",
                 (
                     p["title"],
                     p.get("body", ""),
                     p["due_at"],
                     p.get("next_action", ""),
                     ReminderStatus.SCHEDULED.value,
+                    collapse,
                     now_ms(),
                     linked["reminder_id"],
                 ),
             )
             return linked["reminder_id"], False
+        # deadline slot: merge onto an active row already at this matter+due
+        # (covers correction reschedule + follow-up CREATE_REMINDER)
+        deadline_key = f"{p['matter_id']}:deadline"
+        scannable = (
+            ReminderStatus.SCHEDULED.value,
+            ReminderStatus.SNOOZED.value,
+            ReminderStatus.MISSED.value,
+        )
+        ph_s = ",".join("?" * len(scannable))
+        incoming_is_deadline = collapse == deadline_key or collapse.endswith(":deadline")
+        if incoming_is_deadline:
+            same_due = self.store.query_one(
+                f"SELECT reminder_id FROM reminders "
+                f"WHERE matter_id=? AND due_at=? AND status IN ({ph_s}) LIMIT 1",
+                (p["matter_id"], p["due_at"], *scannable),
+            )
+        else:
+            same_due = self.store.query_one(
+                f"SELECT reminder_id FROM reminders "
+                f"WHERE matter_id=? AND due_at=? AND status IN ({ph_s}) AND collapse_key=? LIMIT 1",
+                (p["matter_id"], p["due_at"], *scannable, deadline_key),
+            )
+        if same_due:
+            self.store.execute(
+                "UPDATE reminders SET title=?, body=?, next_action=?, collapse_key=?, status=?, updated_at=? WHERE reminder_id=?",
+                (
+                    p["title"],
+                    p.get("body", ""),
+                    p.get("next_action", ""),
+                    collapse,
+                    ReminderStatus.SCHEDULED.value,
+                    now_ms(),
+                    same_due["reminder_id"],
+                ),
+            )
+            return same_due["reminder_id"], False
         rid = new_id("rem")
         now = now_ms()
         self.store.execute(
