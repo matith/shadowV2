@@ -92,6 +92,14 @@ class ArchiveLedger:
         arch = (m.get("fields") or {}).get("archive") if m else None
         return {"receipt": receipt, "archive": arch}
 
+    def mini_capsule(self, matter_id: str) -> Optional[dict]:
+        """Archive Capsule only — safe for daily context (no full history)."""
+        m = self.matter.get(matter_id)
+        if not m or m.get("status") != "ARCHIVED":
+            return None
+        arch = (m.get("fields") or {}).get("archive") or {}
+        return arch.get("mini_capsule")
+
     def recall(self, keyword: str) -> list[dict]:
         rows = self.store.query("SELECT * FROM matters WHERE status='ARCHIVED'")
         out = []
@@ -99,6 +107,7 @@ class ArchiveLedger:
         for r in rows:
             fields = json.loads(r["fields"])
             arch = fields.get("archive") or {}
+            mini = arch.get("mini_capsule") or {}
             blob = f"{r['title']} {json.dumps(arch, ensure_ascii=False)}"
             if not kw or kw in blob:
                 out.append(
@@ -112,6 +121,47 @@ class ArchiveLedger:
                     }
                 )
         return out
+
+    def drill_down(self, matter_id: str) -> dict:
+        """Full Matter + Events + Source from archive pointer. Archive ≠ delete."""
+        m = self.matter.get(matter_id)
+        if not m:
+            raise KeyError(matter_id)
+        events = [
+            dict(r)
+            for r in self.store.query(
+                "SELECT * FROM events WHERE matter_id=? ORDER BY created_at", (matter_id,)
+            )
+        ]
+        for e in events:
+            e["people"] = json.loads(e.get("people") or "[]")
+            e["payload"] = json.loads(e.get("payload") or "{}")
+        source_ids = sorted({e.get("source_id") for e in events if e.get("source_id")})
+        sources = []
+        for sid in source_ids:
+            row = self.store.query_one("SELECT * FROM raw_sources WHERE source_id=?", (sid,))
+            if row:
+                src = dict(row)
+                # do not dump full text into the drill-down card; pointer + meta only
+                src.pop("text_content", None)
+                sources.append(src)
+        fields = m.get("fields") or {}
+        arch = fields.get("archive") or {}
+        return {
+            "matter": {k: v for k, v in m.items() if k != "fields"},
+            "fields": fields,
+            "mini_capsule": arch.get("mini_capsule"),
+            "pointer": arch.get("pointer") or f"matter:{matter_id}",
+            "events": events,
+            "sources": sources,
+            "reminders": [
+                dict(r)
+                for r in self.store.query(
+                    "SELECT reminder_id,title,due_at,status FROM reminders WHERE matter_id=?",
+                    (matter_id,),
+                )
+            ],
+        }
 
 
 class KnowledgeLedger:

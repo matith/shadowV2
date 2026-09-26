@@ -90,6 +90,38 @@ class WorkingContextCompiler:
         for m in ranked[:budget_items]:
             if score(m) == 0 and m["status"] in ("DONE", "ARCHIVED") and len(candidates) > budget_items:
                 continue
+            if m["status"] == "ARCHIVED":
+                # daily context carries mini capsule only — full history stays on drill-down
+                fields = m.get("fields") or {}
+                if isinstance(fields, str):
+                    fields = json.loads(fields)
+                arch = fields.get("archive") or {}
+                mini = arch.get("mini_capsule") or {
+                    "goal": m["title"],
+                    "current": m.get("next_action") or m.get("status"),
+                    "open_items": [],
+                }
+                cap = {
+                    "matter_id": m["matter_id"],
+                    "goal": mini.get("goal") or m["title"],
+                    "current": mini.get("current") or "",
+                    "recent": [],
+                    "open_items": mini.get("open_items") or [],
+                    "files": [],
+                    "evidence": [],
+                    "archived": True,
+                    "pointer": arch.get("pointer") or f"matter:{m['matter_id']}",
+                }
+                capsules.append(cap)
+                sources.append(
+                    {
+                        "type": "archive_mini",
+                        "matter_id": m["matter_id"],
+                        "title": m["title"],
+                        "pointer": cap["pointer"],
+                    }
+                )
+                continue
             cap = self.summary.capsule.get(m["matter_id"])
             if not cap or self.summary.is_stale(m["matter_id"]):
                 try:
