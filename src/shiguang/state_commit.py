@@ -176,12 +176,26 @@ class CorrectionApplier:
         changes = [{"field": field, "old": old_value, "new": new_value, "correction_id": correction_id}]
         if target_kind == "matter":
             self.matter.update_fields(target_id, {field: new_value})
+            # Matter due correction must move linked active reminders in the same txn,
+            # otherwise the old due still fires after the user says "不是周三，是周四".
+            if field == "due_at":
+                changes.extend(self._reschedule_linked_reminders(target_id, old_value, new_value))
         elif target_kind == "reminder":
             col = REMINDER_COLUMNS[field]
             self.store.execute(
                 f"UPDATE reminders SET {col}=?, updated_at=? WHERE reminder_id=?",
                 (new_value, now_ms(), target_id),
             )
+            if field == "due_at":
+                # keep status scannable if it had already slipped into MISSED
+                row = self.store.query_one(
+                    "SELECT status FROM reminders WHERE reminder_id=?", (target_id,)
+                )
+                if row and row["status"] == ReminderStatus.MISSED.value:
+                    self.store.execute(
+                        "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
+                        (ReminderStatus.SCHEDULED.value, now_ms(), target_id),
+                    )
         return {
             "correction_id": correction_id,
             "old": old_value,
@@ -189,6 +203,47 @@ class CorrectionApplier:
             "changes": changes,
             "invalidated_interps": invalidated,
         }
+
+    def _reschedule_linked_reminders(self, matter_id: str, old_due: Any, new_due: Any) -> list[dict]:
+        """Reschedule active reminders whose due is the corrected time.
+
+        Link rule: same matter + due_at == old semantic time. Only SCHEDULED /
+        SNOOZED / MISSED rows move — FIRED/COMPLETED/CANCELLED stay as history.
+        """
+        try:
+            old_due_i = int(old_due) if old_due is not None else None
+            new_due_i = int(new_due) if new_due is not None else None
+        except (TypeError, ValueError):
+            return []
+        if old_due_i is None or new_due_i is None or old_due_i == new_due_i:
+            return []
+        active = (
+            ReminderStatus.SCHEDULED.value,
+            ReminderStatus.SNOOZED.value,
+            ReminderStatus.MISSED.value,
+        )
+        placeholders = ",".join("?" * len(active))
+        rows = self.store.query(
+            f"SELECT reminder_id, due_at, title FROM reminders "
+            f"WHERE matter_id=? AND due_at=? AND status IN ({placeholders})",
+            (matter_id, old_due_i, *active),
+        )
+        out: list[dict] = []
+        for r in rows:
+            self.store.execute(
+                "UPDATE reminders SET due_at=?, updated_at=? WHERE reminder_id=?",
+                (new_due_i, now_ms(), r["reminder_id"]),
+            )
+            out.append(
+                {
+                    "field": "reminder.due_at",
+                    "old": r["due_at"],
+                    "new": new_due_i,
+                    "reminder_id": r["reminder_id"],
+                    "reason": "correction_reschedule",
+                }
+            )
+        return out
 
     def _invalidate_active_interps(self, target_kind: str, target_id: str) -> list[str]:
         rows = self.store.query(
@@ -397,6 +452,8 @@ class PatchCommitter:
 
         Delivery collapse_key is NOT create-identity: completed/cancelled
         reminders must not swallow a new commitment with the same title.
+        An explicit collapse_key on an *active* row is a semantic link —
+        correction/replace reschedules that row instead of double-booking.
         """
         active = ("SCHEDULED", "SNOOZED", "MISSED", "FIRED")
         placeholders = ",".join("?" * len(active))
@@ -406,9 +463,29 @@ class PatchCommitter:
         )
         if existing:
             return existing["reminder_id"], False
+        collapse = p.get("collapse_key") or f"{p['matter_id']}:{p['title']}:{p['due_at']}"
+        # semantic replace: same collapse_key active row moves to the new due
+        linked = self.store.query_one(
+            f"SELECT reminder_id, due_at, status FROM reminders "
+            f"WHERE matter_id=? AND collapse_key=? AND status IN ({placeholders})",
+            (p["matter_id"], collapse, *active),
+        )
+        if linked:
+            self.store.execute(
+                "UPDATE reminders SET title=?, body=?, due_at=?, next_action=?, status=?, updated_at=? WHERE reminder_id=?",
+                (
+                    p["title"],
+                    p.get("body", ""),
+                    p["due_at"],
+                    p.get("next_action", ""),
+                    ReminderStatus.SCHEDULED.value,
+                    now_ms(),
+                    linked["reminder_id"],
+                ),
+            )
+            return linked["reminder_id"], False
         rid = new_id("rem")
         now = now_ms()
-        collapse = p.get("collapse_key") or f"{p['matter_id']}:{p['title']}:{p['due_at']}"
         self.store.execute(
             "INSERT INTO reminders(reminder_id,matter_id,title,body,due_at,status,fire_count,last_fired_at,collapse_key,next_action,created_at,updated_at)"
             " VALUES(?,?,?,?,?,?,0,NULL,?,?,?,?)",
