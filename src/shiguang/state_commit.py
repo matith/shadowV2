@@ -598,6 +598,15 @@ class StateCommitEngine:
                     mid = result.get("matter_id") or op.matter_ref or op.payload.get("matter_id")
                     if mid:
                         matter_ids.add(mid)
+                    # parent link changes dirty both sides so tree rollup can refresh
+                    for ch in changes:
+                        if ch.get("field") == "parent_matter_id":
+                            if ch.get("old"):
+                                matter_ids.add(ch["old"])
+                            if ch.get("new"):
+                                matter_ids.add(ch["new"])
+                    if op.kind == OpKind.CREATE_MATTER.value and op.payload.get("parent_matter_id"):
+                        matter_ids.add(op.payload["parent_matter_id"])
                     self.store.execute(
                         "INSERT INTO op_log(op_id,kind,payload,result,commit_id,created_at) VALUES(?,?,?,?,?,?)",
                         (

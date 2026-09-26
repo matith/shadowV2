@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""summary-system: capsule-store + incremental-reducer + dirty-tracker."""
+"""summary-system: capsule-store + incremental-reducer + dirty-tracker + tree-propagator."""
 from __future__ import annotations
 
 import json
@@ -8,6 +8,42 @@ from typing import Any, Optional
 from .ledgers import EventLedger, MatterLedger
 from .storage import Store
 from .types import now_ms
+
+# Capsule content keys that participate in "did anything real change?".
+_CONTENT_KEYS = ("goal", "current", "recent", "open_items", "files", "evidence")
+
+
+class TreePropagator:
+    """子→父脏传播。无变化即停，不向祖父级继续扩散。"""
+
+    def __init__(self, store: Store, matter: MatterLedger):
+        self.store = store
+        self.matter = matter
+
+    def parent_id(self, matter_id: str) -> Optional[str]:
+        row = self.store.query_one("SELECT parent_matter_id FROM matters WHERE matter_id=?", (matter_id,))
+        if not row:
+            return None
+        return row["parent_matter_id"]
+
+    def ancestors(self, matter_id: str, *, max_hops: int = 32) -> list[str]:
+        out: list[str] = []
+        seen = {matter_id}
+        cur = self.parent_id(matter_id)
+        hops = 0
+        while cur and cur not in seen and hops < max_hops:
+            out.append(cur)
+            seen.add(cur)
+            cur = self.parent_id(cur)
+            hops += 1
+        return out
+
+    def open_children(self, matter_id: str) -> list[dict]:
+        rows = self.store.query(
+            "SELECT matter_id,title,status,next_action FROM matters WHERE parent_matter_id=?",
+            (matter_id,),
+        )
+        return [dict(r) for r in rows]
 
 
 class DirtyTracker:
@@ -106,6 +142,19 @@ class SummarySystem:
         self.event = event
         self.capsule = CapsuleStore(store)
         self.dirty = DirtyTracker(store)
+        self.tree = TreePropagator(store, matter)
+
+    def _children_open_items(self, matter_id: str) -> list[str]:
+        items = []
+        for c in self.tree.open_children(matter_id):
+            if c.get("status") in ("DONE", "ARCHIVED"):
+                continue
+            label = c.get("title") or c.get("matter_id")
+            if c.get("next_action"):
+                items.append(f"子项 {label}：{c['next_action']}")
+            else:
+                items.append(f"子项 {label}")
+        return items
 
     def sync_with_matter(self, matter_id: str) -> dict:
         m = self.matter.get(matter_id)
@@ -119,6 +168,7 @@ class SummarySystem:
                 open_items.append(m["next_action"])
             if m.get("due_at"):
                 open_items.append(f"截止：{m['due_at']}")
+        open_items.extend(self._children_open_items(matter_id))
         patch = {
             "goal": m["title"],
             "current": f"状态 {m['status']}" + (f"；下一步 {m['next_action']}" if m.get("next_action") else ""),
@@ -134,12 +184,51 @@ class SummarySystem:
         return cap
 
     def process_dirty(self) -> list[str]:
+        """Sync dirty matters; child change marks parent dirty. No content change → stop upward."""
         done = []
-        for node in self.dirty.list_dirty():
-            if node["node_kind"] == "matter":
-                self.sync_with_matter(node["node_id"])
-                done.append(node["node_id"])
+        seen: set[str] = set()
+        for _ in range(32):
+            nodes = [n for n in self.dirty.list_dirty() if n["node_id"] not in seen]
+            if not nodes:
+                break
+            progressed = False
+            for node in nodes:
+                if node["node_kind"] != "matter":
+                    seen.add(node["node_id"])
+                    continue
+                mid = node["node_id"]
+                seen.add(mid)
+                progressed = True
+                before = self.capsule.get(mid)
+                try:
+                    after = self.sync_with_matter(mid)
+                except KeyError:
+                    self.dirty.clear(mid)
+                    continue
+                done.append(mid)
+                parent = self.tree.parent_id(mid)
+                if not parent or parent in seen:
+                    continue
+                # 子项变化 → 父级 dirty；增量后无变化即停
+                if before is not None and not self._content_changed(before, after):
+                    continue
+                self.dirty.mark(parent, "matter")
+            if not progressed:
+                break
         return done
+
+    @staticmethod
+    def _content_changed(before: Optional[dict], after: dict) -> bool:
+        if before is None:
+            return True
+        for k in _CONTENT_KEYS:
+            b, a = before.get(k), after.get(k)
+            if isinstance(b, list) or isinstance(a, list):
+                if (b or []) != (a or []):
+                    return True
+            elif (b or "") != (a or ""):
+                return True
+        return False
 
     def is_stale(self, matter_id: str) -> bool:
         cap = self.capsule.get(matter_id)
